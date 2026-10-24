@@ -14,7 +14,6 @@ The current battery percentage is drawn directly onto the tray icon.
 | Vendor | Tested with | Connection |
 |---|---|---|
 | Pulsar (VID `0x3710`) | X3 LHD CrazyLight mini / Medium | wired and 8K Dongle Gen.2 |
-| Pulsar (VID `0x3710`), XS-1 platform | X2A v3 eS Mini | wired and 8K dongle (PID `0x5403`) |
 | VAXEE (VID `0x3057`) | XE-S | 4K wireless dongle |
 
 Other mice from these vendors that use the same receivers/firmware will likely work,
@@ -29,15 +28,13 @@ since devices are matched by vendor ID + HID usage page rather than specific pro
 - Digits are drawn at the tray's real pixel size with the same font and smoothing as the
   taskbar clock
 - Tooltip shows model name, percentage, charging state, polling rate, and battery voltage (Pulsar only)
-- Left-click = refresh now; right-click = menu with **Refresh**, **Polling rate**, **Icon style**,
+- Left-click = refresh now; right-click = menu with **Refresh**, **Polling rate**, **Battery icon**,
   **Start with Windows**, **Exit**
-- **Icon style** picks what the icon shows: the digits alone (default), digits with a small
-  battery glyph above or below, or the battery glyph alone — the glyph is filled to the
-  charge level
+- **Battery icon** adds a small battery glyph, filled to the charge level, above or below the
+  number (hidden by default)
 - **Polling rate** lists the rates the current link supports with the active one checked;
   picking one writes it to the mouse, the same setting the vendor's web driver changes.
-  Pulsar: 125 Hz–1 kHz on cable, up to 8 kHz on the 8K dongle (the X2A v3 Mini also does
-  8 kHz on its cable). VAXEE: 500 Hz–4 kHz on the
+  Pulsar: 125 Hz–1 kHz on cable, up to 8 kHz on the 8K dongle. VAXEE: 500 Hz–4 kHz on the
   4K dongle (1 kHz max on cable or in a "Standard" tracking mode)
 
 If the mouse is asleep and doesn't answer, the last known value is shown in gray and
@@ -70,11 +67,7 @@ taskbar (or enable it under taskbar settings) to keep it visible.
 These mice estimate charge from battery voltage (no coulomb counting), so the
 percentage jumps up when you plug in and sags back when you unplug — that's the
 firmware's estimate, not a bug here. Treat readings as roughly ±10%.
-VAXEE and the Pulsar XS-1 mice (X2A v3) don’t expose voltage.
-VAXEE also reports in 5% steps.
-
-The X2A v3’s 8K dongle can’t tell "mouse asleep" from "still waiting", so a
-sleeping mouse just shows the stale reading until it wakes and the next poll lands.
+VAXEE reports in 5% steps and does not expose voltage.
 
 Polling happens over the wireless link, so the interval defaults to 4 minutes (`POLL_INTERVAL_MS` in `src/main.rs`).
 
@@ -88,10 +81,6 @@ The vendor protocols were reverse-engineered by the community:
   The settings register map (polling rate at address `0x0000`, link type from the
   `0x01` info reply) comes from [packerlschupfer/pulsar-mouse-linux](https://github.com/packerlschupfer/pulsar-mouse-linux)
   and [andrewrabert/python-pulsar-mouse-tool](https://github.com/andrewrabert/python-pulsar-mouse-tool)
-- Pulsar XS-1 (X2A v3 / X3 family): 64-byte feature-report protocol and its pending/answer
-  handshake as documented by [santoshpanna/Pulsar-X3-Web-Config](https://github.com/santoshpanna/Pulsar-X3-Web-Config),
-  [packerlschupfer/pulsar-mouse-linux](https://github.com/packerlschupfer/pulsar-mouse-linux) and
-  [OpenMouse](https://github.com/OpenMouse-Project/mouse-protocol)
 - VAXEE: feature-report protocol documented in [stuffz/mouse-battery-monitor](https://github.com/stuffz/mouse-battery-monitor);
   the polling-rate (`0x07`) and tracking-mode (`0x08`) commands follow the
   [VAXEE Control Center](https://vcc.vaxee.co/) web driver
@@ -102,7 +91,7 @@ mousebatt makes no network connections and collects nothing. It only opens HID
 interfaces whose vendor ID is Pulsar or VAXEE, sends the vendor's battery query,
 and reads the reply. The only thing it ever writes to a mouse is the polling rate you
 pick from the menu. The "Start with Windows" toggle writes one value under
-`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and the **Icon style** choice is
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and the **Battery icon** choice is
 saved under `HKCU\Software\mousebatt`. To match the icon to the taskbar it reads the
 colour of a few taskbar pixels next to the notification area each time it polls the
 mouse; nothing else on screen is read.
@@ -125,3 +114,23 @@ include the product string from the tooltip and, ideally, a captured report.
 ## License
 
 [MIT](LICENSE).
+
+
+## Per-program rates, hotkeys and sounds
+
+Optional. Without a `mousebatt.ini` next to `mousebatt.exe`, nothing below is active.
+Right-click the tray icon > **Edit mousebatt.ini…** creates a commented example and opens it;
+**Reload mousebatt.ini** applies your edits. See `mousebatt.example.ini` for every setting.
+
+- **Rules**: `[apps]` maps a program file name (Task Manager > Details) to a rate; `default`
+  covers everything else (your "desktop" rate, or `keep` to leave the mouse alone). The rule
+  applies when that program's window gets the focus, after `delay_ms` so alt-tabbing through
+  other windows doesn't flap the rate. Rates above what the current link supports (cable =
+  1 kHz) are lowered to the maximum.
+- **Hotkeys**: `Ctrl+Shift+P = set 2000`, `up`, `down`, `toggle 1000 2000`, `auto`. A hotkey or
+  a menu pick takes manual control until the `auto` hotkey / the "Automatic" menu item.
+- **Reliability**: each change is read back from the mouse and re-sent if needed.
+  `enforce = true` re-applies the wanted rate when the periodic check (every 4 minutes, and
+  after a replug or resume) finds another one.
+- **Cost**: no polling loop. Focus changes and hotkeys are delivered by Windows to the existing
+  message loop; between events the process is blocked in `GetMessage` as before.

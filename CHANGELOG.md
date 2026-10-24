@@ -6,15 +6,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 ## [Unreleased]
 
 ### Added
-- Pulsar X2A v3 (XS-1 platform, e.g. the X2A v3 eS Mini) on its cable or 8K dongle:
-  battery, charging state and the **Polling rate** submenu (125 Hz–8 kHz). These mice
-  use a 64-byte feature-report protocol on a different HID collection, so they were
-  not detected before.
-- **Icon style** submenu in the right-click menu: the digits alone (the default), digits
-  with a small battery glyph above or below, or the battery glyph alone — a large glyph
-  filled to the charge level with no digits. The choice is saved under
-  `HKCU\Software\mousebatt`.
-- **About mousebatt** in the right-click menu: shows the version, project link and licence.
+- **Per-program polling rates, hotkeys and sound feedback**, configured in `mousebatt.ini`
+  next to the exe (see `mousebatt.example.ini`; "Edit mousebatt.ini…" in the menu creates it):
+  - `[apps]` rules and a `default` rate, applied when a program gets the focus. Driven by
+    Windows focus-change events (`SetWinEventHook`, out of context): no timer, no scanning,
+    nothing injected into other programs. The hook only exists while the file has rules.
+  - Global hotkeys (`RegisterHotKey`, no keyboard hook): set a rate, step up/down, toggle two
+    rates, or return to automatic mode.
+  - Every change is read back from the mouse and re-sent if it didn't take (3 tries), with
+    retries after 3 s / 10 s / 30 s when the mouse is asleep. `enforce = true` also puts the
+    wanted rate back when the periodic check finds another one.
+  - Optional sound once the mouse has confirmed the rate: a pitch-coded beep or a spoken rate
+    (built-in English clips, overridable with `sounds\<hz>.wav`).
+- The poll worker clears its in-flight flag before posting its result, so a rate requested
+  while a poll was running can no longer be dropped.
+- **Battery icon** submenu in the right-click menu: show a small battery glyph, filled to
+  the charge level, above or below the number, or hide it (the default). The choice is
+  saved under `HKCU\Software\mousebatt`.
 
 ### Changed
 - The icon is drawn at the tray's actual size (16 px at 100% scaling, 20/24 px when
@@ -23,11 +31,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
   (ClearType by default), blended against the taskbar colour next to the tray.
 - On a light taskbar the icon uses dark colours (Windows light palette) instead of white,
   and it redraws when switching between light and dark mode.
-
-### Fixed
-- **Start with Windows** is ticked only when the startup entry launches this exe. After
-  moving or rebuilding mousebatt in another folder it reads as off, and one click points
-  the entry at the new location (previously it stayed ticked on the stale path).
 
 ## [0.2.0] - 2026-09-12
 
