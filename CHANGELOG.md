@@ -6,9 +6,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 ## [Unreleased]
 
 ### Added
-- **Battery icon** submenu in the right-click menu: show a small battery glyph, filled to
-  the charge level, above or below the number, or hide it (the default). The choice is
-  saved under `HKCU\Software\mousebatt`.
+- **Icon style** submenu in the right-click menu: the digits alone (the default), digits
+  with a small battery glyph above or below, or the battery glyph alone — a large glyph
+  filled to the charge level with no digits. The choice is saved under
+  `HKCU\Software\mousebatt`.
 
 ### Changed
 - The icon is drawn at the tray's actual size (16 px at 100% scaling, 20/24 px when
