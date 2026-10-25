@@ -665,6 +665,51 @@ fn paint_battery(drawn: &mut [u32], size: i32, l: &Layout, percent: Option<u8>, 
 /// The tray icon for `text`, the battery percentage or a placeholder such as
 /// "…" (drawn with an empty battery), in palette colour `color`.
 pub fn battery_icon(text: &str, color: u32, glyph: BatteryGlyph) -> Hicon {
+    make_icon(color, |size, fg, bg| {
+        let l = layout(size, glyph);
+        let mut drawn = text_pixels(text, size, &l, fg, bg);
+        if glyph != BatteryGlyph::Hidden {
+            paint_battery(&mut drawn, size, &l, text.parse().ok(), fg, bg);
+        }
+        drawn
+    })
+}
+
+/// Two short lines of text, one above the other (battery % over polling
+/// rate): each gets half the icon, so the digits are smaller than in the
+/// single-line icon but both stay readable at tray size.
+pub fn stacked_icon(top: &str, bottom: &str, color: u32) -> Hicon {
+    make_icon(color, |size, fg, bg| {
+        let half = size / 2;
+        let upper = Layout {
+            line: (size / 16).max(1),
+            body_x: 0,
+            body_y: 0,
+            body_w: 0,
+            body_h: 0,
+            text_top: 0,
+            text_h: half,
+            max_w: size,
+            max_h: (half - 1).max(1),
+        };
+        let lower = Layout {
+            text_top: half,
+            text_h: size - half,
+            max_h: (size - half - 1).max(1),
+            ..upper
+        };
+        let mut drawn = text_pixels(top, size, &upper, fg, bg);
+        let low = text_pixels(bottom, size, &lower, fg, bg);
+        // Each call leaves everything outside its own rows as plain background.
+        let split = (half * size) as usize;
+        drawn[split..].copy_from_slice(&low[split..]);
+        drawn
+    })
+}
+
+/// Shared by every icon style: pick the taskbar-appropriate colours, let
+/// `draw` produce the size x size pixels, and turn them into an `HICON`.
+fn make_icon(color: u32, draw: impl FnOnce(i32, u32, u32) -> Vec<u32>) -> Hicon {
     let size = icon_size();
     let Some(mut canvas) = Canvas::new(size) else {
         return Hicon(null_mut());
@@ -672,11 +717,7 @@ pub fn battery_icon(text: &str, color: u32, glyph: BatteryGlyph) -> Hicon {
     let light = taskbar_is_light();
     let fg = if light { light_variant(color) } else { color };
     let bg = cached_taskbar_color(light);
-    let l = layout(size, glyph);
-    let mut drawn = text_pixels(text, size, &l, fg, bg);
-    if glyph != BatteryGlyph::Hidden {
-        paint_battery(&mut drawn, size, &l, text.parse().ok(), fg, bg);
-    }
+    let drawn = draw(size, fg, bg);
     let (fg_rgb, bg_rgb) = (colorref_rgb(fg), colorref_rgb(bg));
     for (px, &d) in canvas.pixels().iter_mut().zip(&drawn) {
         *px = unblend(pixel_rgb(d), fg_rgb, bg_rgb);

@@ -21,8 +21,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
     wanted rate back when the periodic check finds another one.
   - Optional sound once the mouse has confirmed the rate: a soft bell note or the spoken
     number (built-in English clips, overridable with `sounds\<hz>.wav`).
-- Tray menu: "Icon shows > Battery level / Polling rate" (1K, 2K, 4K, 8K, 500, ...) and a
-  clearer "Switch rate automatically when a game runs" switch.
+- Tray menu: "Icon shows > Battery level / Polling rate / Both" (1K, 2K, 4K, 8K, 500, ...;
+  "Both" stacks battery % over the rate in smaller digits) and a clearer "Switch rate
+  automatically when a game runs" switch.
+- **Settings window** (tray menu > Settings…): desktop rate, games with their rates (picked from
+  the programs running now, or typed), hotkeys entered by pressing the keys, sound and
+  enforce options. Save rewrites `mousebatt.ini` (comments of a hand-edited file are not kept;
+  presets and the delay are) and reloads it; the real hotkeys are suspended while it is open.
+  A small `build.rs` embeds `mousebatt.manifest` so the window uses the modern control style.
 - The poll worker clears its in-flight flag before posting its result, so a rate requested
   while a poll was running can no longer be dropped.
 - **Battery icon** submenu in the right-click menu: show a small battery glyph, filled to

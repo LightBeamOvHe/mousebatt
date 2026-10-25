@@ -31,6 +31,7 @@ features = [
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Media_Audio",
+    "Win32_UI_Controls",
 ]
 
 [profile.release]

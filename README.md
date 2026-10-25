@@ -132,6 +132,9 @@ Right-click the tray icon > **Edit mousebatt.ini…** creates a commented exampl
 - **Reliability**: each change is read back from the mouse and re-sent if needed.
   `enforce = true` re-applies the wanted rate when the periodic check (every 4 minutes, and
   after a replug or resume) finds another one.
-- **Icon**: right-click > Icon shows > Polling rate draws 1K, 2K, ... instead of the battery %.
+- **Settings window**: right-click > Settings… edits all of the above without touching the
+  file. Saving rewrites `mousebatt.ini` (comments are not kept) and reloads it.
+- **Icon**: right-click > Icon shows > Polling rate draws 1K, 2K, ... instead of the battery %;
+  Both stacks the battery % over the rate in smaller digits.
 - **Cost**: no polling loop. Focus changes and hotkeys are delivered by Windows to the existing
   message loop; between events the process is blocked in `GetMessage` as before.

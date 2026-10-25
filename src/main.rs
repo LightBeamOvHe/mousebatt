@@ -12,6 +12,7 @@ mod hid;
 mod icon;
 mod protocol;
 mod sound;
+mod ui;
 mod watch;
 
 use std::cell::{Cell, RefCell};
@@ -73,6 +74,7 @@ const MENU_EXIT: usize = 3;
 const MENU_AUTO: usize = 4;
 const MENU_EDIT_CFG: usize = 5;
 const MENU_RELOAD_CFG: usize = 6;
+const MENU_SETTINGS: usize = 7;
 /// Polling-rate items are `MENU_RATE_BASE + index into PollingInfo::rates`.
 const MENU_RATE_BASE: usize = 100;
 /// Battery-icon items are `MENU_GLYPH_BASE + index into BatteryGlyph::ALL`.
@@ -141,8 +143,9 @@ thread_local! {
     /// (0 = none). A manual pick doesn't touch it, so the rules only act again
     /// when a listed program starts or stops.
     static RULE_RATE: Cell<u16> = const { Cell::new(0) };
-    /// true = the tray icon shows the polling rate instead of the battery %.
-    static ICON_RATE: Cell<bool> = const { Cell::new(false) };
+    /// What the tray icon shows: 0 = battery %, 1 = polling rate, 2 = both
+    /// (battery over rate, smaller).
+    static ICON_SHOWS: Cell<u8> = const { Cell::new(0) };
     static RETRY_STEP: Cell<u8> = const { Cell::new(0) };
     /// Focus-hook handle (0 = not installed).
     static HOOK: Cell<usize> = const { Cell::new(0) };
@@ -202,8 +205,11 @@ fn main() {
     unsafe {
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            // Tab / Enter / Esc inside the settings window, when it is open.
+            if !ui::dialog_message(&msg) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 }
@@ -213,7 +219,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_CREATE => {
             MAIN_HWND.store(hwnd as usize, Ordering::Relaxed);
-            ICON_RATE.with(|c| c.set(load_dword(ICON_VALUE) == Some(1)));
+            ICON_SHOWS.with(|c| c.set(load_dword(ICON_VALUE).map_or(0, |v| v.min(2) as u8)));
             update_tray(hwnd, &TrayView::placeholder(), true);
             // SAFETY: plain handle + id arguments; no callback pointer.
             unsafe { SetTimer(hwnd, TIMER_POLL, POLL_INTERVAL_MS, None) };
@@ -258,6 +264,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WMAPP_WARN => {
             show_warnings();
+            0
+        }
+        // The settings window suspends the hotkeys while it is open (so that
+        // pressing one inside its boxes doesn't trigger it), then hands them
+        // back, or asks for a full reload after saving.
+        ui::MSG_SUSPEND_HOTKEYS => {
+            unregister_hotkeys(hwnd);
+            0
+        }
+        ui::MSG_RESUME_HOTKEYS => {
+            sync_hotkeys(hwnd);
+            0
+        }
+        ui::MSG_RELOAD_CONFIG => {
+            reload_config(hwnd);
             0
         }
         WM_DEVICECHANGE => {
@@ -782,12 +803,17 @@ fn sync_hook() {
     }
 }
 
-fn sync_hotkeys(hwnd: HWND) {
+fn unregister_hotkeys(hwnd: HWND) {
     for id in 1..=HOTKEY_COUNT.with(Cell::get) {
         // SAFETY: plain handle + id arguments; an id that was never
         // registered just makes the call fail.
         unsafe { UnregisterHotKey(hwnd, id as i32) };
     }
+    HOTKEY_COUNT.with(|c| c.set(0));
+}
+
+fn sync_hotkeys(hwnd: HWND) {
+    unregister_hotkeys(hwnd);
     let keys: Vec<(String, u32, u32)> = CFG.with(|c| {
         c.borrow()
             .hotkeys
@@ -945,10 +971,12 @@ fn base_nid(hwnd: HWND) -> NOTIFYICONDATAW {
 
 fn update_tray(hwnd: HWND, view: &TrayView, add: bool) {
     let tip = view.tip.as_str();
-    // "Polling rate" mode draws 1K / 2K ... with no battery outline (it would
-    // describe the wrong number); everything else is the usual battery icon.
-    let new_icon = match (&view.rate_text, ICON_RATE.with(Cell::get)) {
-        (Some(rate), true) => icon::battery_icon(rate, view.color, BatteryGlyph::Hidden),
+    // "Polling rate" draws 1K / 2K ... with no battery outline (it would
+    // describe the wrong number); "Both" stacks battery % over the rate;
+    // everything else is the usual battery icon.
+    let new_icon = match (&view.rate_text, ICON_SHOWS.with(Cell::get)) {
+        (Some(rate), 1) => icon::battery_icon(rate, view.color, BatteryGlyph::Hidden),
+        (Some(rate), 2) => icon::stacked_icon(&view.text, rate, view.color),
         _ => icon::battery_icon(&view.text, view.color, GLYPH.with(Cell::get)),
     };
     LAST_VIEW.with(|v| *v.borrow_mut() = Some(view.clone()));
@@ -992,7 +1020,7 @@ fn show_menu(hwnd: HWND) {
     let polling = LAST_GOOD.with(|g| g.borrow().as_ref().and_then(|s| s.polling));
     let has_rules = CFG.with(|c| c.borrow().has_rules());
     let auto = AUTO.with(Cell::get);
-    let icon_rate = ICON_RATE.with(Cell::get);
+    let icon_shows = ICON_SHOWS.with(Cell::get);
     let mut pt = POINT { x: 0, y: 0 };
     // SAFETY: the menu (and the submenu it owns) is created and destroyed
     // within this block; every string temporary lives for the full statement
@@ -1034,10 +1062,13 @@ fn show_menu(hwnd: HWND) {
             wide("Battery icon").as_ptr(),
         );
         let shows_sub = CreatePopupMenu();
-        for (i, label) in ["Battery level", "Polling rate"].into_iter().enumerate() {
+        for (i, label) in ["Battery level", "Polling rate", "Both (battery over rate)"]
+            .into_iter()
+            .enumerate()
+        {
             AppendMenuW(
                 shows_sub,
-                MF_STRING | if (i == 1) == icon_rate { MF_CHECKED } else { 0 },
+                MF_STRING | if i == usize::from(icon_shows) { MF_CHECKED } else { 0 },
                 MENU_ICON_BASE + i,
                 wide(label).as_ptr(),
             );
@@ -1059,18 +1090,21 @@ fn show_menu(hwnd: HWND) {
                 wide("Switch rate automatically when a game runs").as_ptr(),
             );
         }
+        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, wide("Settings…").as_ptr());
+        let adv_sub = CreatePopupMenu();
         AppendMenuW(
-            menu,
+            adv_sub,
             MF_STRING,
             MENU_EDIT_CFG,
             wide("Edit mousebatt.ini…").as_ptr(),
         );
         AppendMenuW(
-            menu,
+            adv_sub,
             MF_STRING,
             MENU_RELOAD_CFG,
             wide("Reload mousebatt.ini").as_ptr(),
         );
+        AppendMenuW(menu, MF_POPUP, adv_sub as usize, wide("Advanced").as_ptr());
         AppendMenuW(
             menu,
             MF_STRING | if autostart { MF_CHECKED } else { 0 },
@@ -1104,6 +1138,7 @@ fn show_menu(hwnd: HWND) {
                 apply_rules_now(hwnd, false);
             }
         }
+        MENU_SETTINGS => ui::open(hwnd),
         MENU_EDIT_CFG => open_config(),
         MENU_RELOAD_CFG => reload_config(hwnd),
         MENU_EXIT => {
@@ -1112,8 +1147,8 @@ fn show_menu(hwnd: HWND) {
             unsafe { PostQuitMessage(0) };
         }
         id => {
-            if let Some(shows) = id.checked_sub(MENU_ICON_BASE).filter(|&i| i < 2) {
-                ICON_RATE.with(|c| c.set(shows == 1));
+            if let Some(shows) = id.checked_sub(MENU_ICON_BASE).filter(|&i| i < 3) {
+                ICON_SHOWS.with(|c| c.set(shows as u8));
                 save_dword(ICON_VALUE, shows as u32);
                 redraw_tray(hwnd);
             } else if let Some(&g) = id

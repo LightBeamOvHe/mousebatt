@@ -69,6 +69,9 @@ pub struct Config {
     pub sound_auto: bool,
     /// Lower-cased program file name -> rate.
     pub apps: HashMap<String, u16>,
+    /// Named rates, sorted by name. Only read by hand-edited files, but kept
+    /// when the settings window rewrites the file.
+    pub presets: Vec<(String, u16)>,
     pub hotkeys: Vec<Hotkey>,
     pub warnings: Vec<String>,
 }
@@ -82,6 +85,7 @@ impl Default for Config {
             sound: SoundMode::Off,
             sound_auto: false,
             apps: HashMap::new(),
+            presets: Vec::new(),
             hotkeys: Vec::new(),
             warnings: Vec::new(),
         }
@@ -174,6 +178,9 @@ impl Config {
             }
         }
 
+        cfg.presets = presets.iter().map(|(k, &v)| (k.clone(), v)).collect();
+        cfg.presets.sort();
+
         for (n, sec, k, v) in &entries {
             match sec.as_str() {
                 "presets" => {}
@@ -240,6 +247,110 @@ impl Config {
     }
 }
 
+/// Write `cfg` to `mousebatt.ini`, replacing the file.
+pub fn save(cfg: &Config) -> std::io::Result<()> {
+    std::fs::write(path(), cfg.to_ini())
+}
+
+impl Config {
+    /// The file the settings window writes. It parses back to the same
+    /// settings; comments of a hand-edited file are not kept.
+    pub fn to_ini(&self) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "# mousebatt.ini - written by the settings window (tray icon > Settings...).\n\
+             # You can still edit it by hand, but the window rewrites the file when it\n\
+             # saves and does not keep comments. mousebatt.example.ini lists every option.\n\n",
+        );
+        out.push_str("[general]\n");
+        match self.default {
+            Fallback::Keep => out.push_str("default = keep\n"),
+            Fallback::Rate(hz) => out.push_str(&format!("default = {hz}\n")),
+        }
+        out.push_str(&format!("delay_ms = {}\n", self.delay_ms));
+        out.push_str(&format!("enforce = {}\n", self.enforce));
+        out.push_str(match self.sound {
+            SoundMode::Off => "sound = off\n",
+            SoundMode::Beep => "sound = beep\n",
+            SoundMode::Voice => "sound = voice\n",
+        });
+        out.push_str(&format!("sound_auto = {}\n", self.sound_auto));
+        if !self.presets.is_empty() {
+            out.push_str("\n[presets]\n");
+            for (name, hz) in &self.presets {
+                out.push_str(&format!("{name} = {hz}\n"));
+            }
+        }
+        out.push_str("\n[apps]\n");
+        let mut apps: Vec<(&String, &u16)> = self.apps.iter().collect();
+        apps.sort();
+        for (name, hz) in apps {
+            out.push_str(&format!("{name} = {hz}\n"));
+        }
+        out.push_str("\n[hotkeys]\n");
+        for h in &self.hotkeys {
+            let combo = fmt_hotkey(h.mods, h.vk).unwrap_or_else(|| h.label.clone());
+            out.push_str(&format!("{combo} = {}\n", fmt_action(&h.action)));
+        }
+        out
+    }
+}
+
+/// The action as written in the file (`set 2000`, `toggle 1000 2000`, ...).
+pub fn fmt_action(action: &Action) -> String {
+    match action {
+        Action::Set(hz) => format!("set {hz}"),
+        Action::Up => "up".into(),
+        Action::Down => "down".into(),
+        Action::Toggle(a, b) => format!("toggle {a} {b}"),
+        Action::Auto => "auto".into(),
+    }
+}
+
+/// `Ctrl+Shift+P` for modifier bits and a virtual-key code; `None` if the key
+/// has no name `parse_hotkey` understands.
+pub fn fmt_hotkey(mods: u32, vk: u32) -> Option<String> {
+    let key = vk_name(vk)?;
+    let mut out = String::new();
+    for (bit, name) in [
+        (MOD_CONTROL, "Ctrl"),
+        (MOD_SHIFT, "Shift"),
+        (MOD_ALT, "Alt"),
+        (MOD_WIN, "Win"),
+    ] {
+        if mods & bit != 0 {
+            out.push_str(name);
+            out.push('+');
+        }
+    }
+    out.push_str(&key);
+    Some(out)
+}
+
+fn vk_name(vk: u32) -> Option<String> {
+    let named = match vk {
+        0x20 => "Space",
+        0x09 => "Tab",
+        0x0D => "Enter",
+        0x1B => "Esc",
+        0x21 => "PageUp",
+        0x22 => "PageDown",
+        0x23 => "End",
+        0x24 => "Home",
+        0x25 => "Left",
+        0x26 => "Up",
+        0x27 => "Right",
+        0x28 => "Down",
+        0x2D => "Insert",
+        0x2E => "Delete",
+        0x30..=0x39 | 0x41..=0x5A => return char::from_u32(vk).map(|c| c.to_string()),
+        0x60..=0x69 => return Some(format!("Numpad{}", vk - 0x60)),
+        0x70..=0x87 => return Some(format!("F{}", vk - 0x70 + 1)),
+        _ => return None,
+    };
+    Some(named.to_string())
+}
+
 /// Drop everything from the first `#` or `;`.
 fn strip_comment(s: &str) -> &str {
     match s.find(['#', ';']) {
@@ -250,7 +361,7 @@ fn strip_comment(s: &str) -> &str {
 
 /// Program names are matched case-insensitively on the bare file name;
 /// `.exe` is added when left out.
-fn normalize_exe(name: &str) -> String {
+pub fn normalize_exe(name: &str) -> String {
     let lower = name.trim().to_lowercase();
     if lower.contains('.') {
         lower
@@ -471,6 +582,33 @@ Ctrl+Shift+A = auto
         assert!(parse_hotkey("F5").is_err(), "needs a modifier");
         assert!(parse_hotkey("Ctrl+A+B").is_err());
         assert!(parse_hotkey("Ctrl+Shift").is_err());
+    }
+
+    #[test]
+    fn ini_round_trips() {
+        let cfg = Config::parse(SAMPLE);
+        let again = Config::parse(&cfg.to_ini());
+        assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+        assert_eq!(again.default, cfg.default);
+        assert_eq!(again.delay_ms, cfg.delay_ms);
+        assert_eq!(again.enforce, cfg.enforce);
+        assert_eq!(again.sound, cfg.sound);
+        assert_eq!(again.sound_auto, cfg.sound_auto);
+        assert_eq!(again.apps, cfg.apps);
+        assert_eq!(again.presets, cfg.presets);
+        assert_eq!(again.hotkeys.len(), cfg.hotkeys.len());
+        for (a, b) in again.hotkeys.iter().zip(&cfg.hotkeys) {
+            assert_eq!((a.mods, a.vk, &a.action), (b.mods, b.vk, &b.action));
+        }
+    }
+
+    #[test]
+    fn hotkey_names_round_trip() {
+        for combo in ["Ctrl+Shift+P", "Alt+F12", "Ctrl+Numpad7", "Win+Left", "Ctrl+5"] {
+            let (mods, vk) = parse_hotkey(combo).unwrap();
+            assert_eq!(fmt_hotkey(mods, vk).as_deref(), Some(combo));
+        }
+        assert_eq!(fmt_hotkey(MOD_CONTROL, 0xFF), None);
     }
 
     #[test]
