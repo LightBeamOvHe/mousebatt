@@ -116,21 +116,22 @@ include the product string from the tooltip and, ideally, a captured report.
 [MIT](LICENSE).
 
 
-## Per-program rates, hotkeys and sounds
+## Per-game rates, hotkeys and sounds
 
 Optional. Without a `mousebatt.ini` next to `mousebatt.exe`, nothing below is active.
 Right-click the tray icon > **Edit mousebatt.ini…** creates a commented example and opens it;
 **Reload mousebatt.ini** applies your edits. See `mousebatt.example.ini` for every setting.
 
 - **Rules**: `[apps]` maps a program file name (Task Manager > Details) to a rate; `default`
-  covers everything else (your "desktop" rate, or `keep` to leave the mouse alone). The rule
-  applies when that program's window gets the focus, after `delay_ms` so alt-tabbing through
-  other windows doesn't flap the rate. Rates above what the current link supports (cable =
-  1 kHz) are lowered to the maximum.
-- **Hotkeys**: `Ctrl+Shift+P = set 2000`, `up`, `down`, `toggle 1000 2000`, `auto`. A hotkey or
-  a menu pick takes manual control until the `auto` hotkey / the "Automatic" menu item.
+  is used while none of them runs (your "desktop" rate, or `keep` to leave the mouse alone).
+  A listed program counts as running from the first time its window gets the focus until it
+  closes, whatever has the focus in between: alt-tabbing writes nothing. Rates above what the
+  current link supports (cable = 1 kHz) are lowered to the maximum.
+- **Hotkeys**: `Ctrl+Shift+P = set 2000`, `up`, `down`, `toggle 1000 2000`, `auto`. A rate
+  chosen by hotkey or from the menu holds until a listed program starts or closes.
 - **Reliability**: each change is read back from the mouse and re-sent if needed.
   `enforce = true` re-applies the wanted rate when the periodic check (every 4 minutes, and
   after a replug or resume) finds another one.
+- **Icon**: right-click > Icon shows > Polling rate draws 1K, 2K, ... instead of the battery %.
 - **Cost**: no polling loop. Focus changes and hotkeys are delivered by Windows to the existing
   message loop; between events the process is blocked in `GetMessage` as before.

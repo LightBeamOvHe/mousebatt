@@ -77,6 +77,8 @@ const MENU_RELOAD_CFG: usize = 6;
 const MENU_RATE_BASE: usize = 100;
 /// Battery-icon items are `MENU_GLYPH_BASE + index into BatteryGlyph::ALL`.
 const MENU_GLYPH_BASE: usize = 200;
+/// "Icon shows" items: `MENU_ICON_BASE` + 0 (battery) / 1 (polling rate).
+const MENU_ICON_BASE: usize = 300;
 
 // Not re-exported cleanly by windows-sys; values are stable Win32 ABI.
 const WM_DEVICECHANGE: u32 = 0x0219;
@@ -132,6 +134,15 @@ thread_local! {
     static WANTED: Cell<u16> = const { Cell::new(0) };
     /// Rate of the rule that is waiting for `TIMER_AUTO`.
     static PENDING_AUTO: Cell<u16> = const { Cell::new(0) };
+    /// Listed programs seen running (file name, process id), the one that had
+    /// the focus most recently last.
+    static ACTIVE: RefCell<Vec<(String, u32)>> = const { RefCell::new(Vec::new()) };
+    /// The rate the rules asked for the last time they changed their mind
+    /// (0 = none). A manual pick doesn't touch it, so the rules only act again
+    /// when a listed program starts or stops.
+    static RULE_RATE: Cell<u16> = const { Cell::new(0) };
+    /// true = the tray icon shows the polling rate instead of the battery %.
+    static ICON_RATE: Cell<bool> = const { Cell::new(false) };
     static RETRY_STEP: Cell<u8> = const { Cell::new(0) };
     /// Focus-hook handle (0 = not installed).
     static HOOK: Cell<usize> = const { Cell::new(0) };
@@ -202,7 +213,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_CREATE => {
             MAIN_HWND.store(hwnd as usize, Ordering::Relaxed);
-            update_tray(hwnd, "…", icon::COLOR_STALE, "mousebatt — reading…", true);
+            ICON_RATE.with(|c| c.set(load_dword(ICON_VALUE) == Some(1)));
+            update_tray(hwnd, &TrayView::placeholder(), true);
             // SAFETY: plain handle + id arguments; no callback pointer.
             unsafe { SetTimer(hwnd, TIMER_POLL, POLL_INTERVAL_MS, None) };
             reload_config(hwnd);
@@ -229,7 +241,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // SAFETY: plain handle + id arguments.
                 unsafe { KillTimer(hwnd, TIMER_AUTO) };
                 let hz = PENDING_AUTO.with(Cell::get);
-                if AUTO.with(Cell::get) && hz != 0 && hz != WANTED.with(Cell::get) {
+                if AUTO.with(Cell::get) && hz != 0 {
                     let announce = CFG.with(|c| c.borrow().sound_auto);
                     request_rate(hwnd, hz, announce);
                 }
@@ -325,7 +337,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         _ => {
             if msg != 0 && msg == TASKBAR_CREATED_MSG.load(Ordering::Relaxed) {
                 // Explorer restarted; re-add our icon.
-                update_tray(hwnd, "…", icon::COLOR_STALE, "mousebatt — reading…", true);
+                update_tray(hwnd, &TrayView::placeholder(), true);
                 start_poll(hwnd);
                 return 0;
             }
@@ -434,8 +446,17 @@ fn redraw_worker(hwnd: HWND) {
 
 fn on_poll_done(hwnd: HWND, result: ReadResult, flags: usize) {
     let last_pct = LAST_GOOD.with(|g| g.borrow().as_ref().map(|s| s.percent));
-    let view = tray_view(&result, last_pct);
-    update_tray(hwnd, &view.text, view.color, &view.tip, false);
+    let mut view = tray_view(&result, last_pct);
+    if view.rate_text.is_none() && matches!(result, ReadResult::NoResponse(_)) {
+        // Asleep: keep showing the last rate we knew, like the stale %.
+        view.rate_text = LAST_GOOD.with(|g| {
+            g.borrow()
+                .as_ref()
+                .and_then(|s| s.polling)
+                .map(|p| rate_label(p.hz))
+        });
+    }
+    update_tray(hwnd, &view, false);
     let polling = match &result {
         ReadResult::Ok(s) => s.polling,
         _ => None,
@@ -577,9 +598,9 @@ fn reconcile(hwnd: HWND, polling: Option<PollingInfo>) {
     }
 }
 
-/// Hotkey / menu pick: take manual control, pausing the per-program rules.
+/// Hotkey / menu pick. It holds until a listed program starts or stops (the
+/// rules then speak again); it does not switch the automatic mode off.
 fn request_manual(hwnd: HWND, hz: u16, announce: bool) {
-    AUTO.with(|a| a.set(false));
     request_rate(hwnd, hz, announce);
 }
 
@@ -614,11 +635,7 @@ fn on_hotkey(hwnd: HWND, id: usize) {
             let next = if current_rate() == a { b } else { a };
             request_manual(hwnd, next, true);
         }
-        Action::Auto => {
-            AUTO.with(|c| c.set(true));
-            sound::notice(sound_mode());
-            eval_foreground();
-        }
+        Action::Auto => apply_rules_now(hwnd, true),
     }
 }
 
@@ -633,45 +650,100 @@ unsafe extern "system" fn on_foreground(
     _event_thread: u32,
     _event_time: u32,
 ) {
-    if let Some(name) = watch::exe_name_of_window(hwnd) {
-        foreground_changed(&name);
+    if let Some((pid, exe)) = watch::process_of_window(hwnd) {
+        foreground_changed(pid, &exe);
     }
 }
 
-/// Apply the focus rule for the program `exe` (lower-case file name): arm the
-/// one-shot timer if its rate isn't the one already wanted, or disarm it if
-/// the focus went back to a program whose rate is. Moving through other
-/// windows in less than `delay_ms` (alt-tab) therefore writes nothing.
-fn foreground_changed(exe: &str) {
+/// The program `exe` (process `pid`) just got the focus. If it is a listed
+/// program it now counts as running, whatever has the focus later; programs
+/// we were tracking that have exited are dropped. Then the rules are looked
+/// at again. Moving between other windows changes nothing here, so alt-tabbing
+/// away from a game (or watching a video elsewhere) never writes to the mouse.
+fn foreground_changed(pid: u32, exe: &str) {
+    let hwnd = MAIN_HWND.load(Ordering::Relaxed) as HWND;
+    let listed = CFG.with(|c| c.borrow().apps.contains_key(exe));
+    ACTIVE.with(|a| {
+        let mut a = a.borrow_mut();
+        // Re-adding moves it to the end: the last one is the most recent.
+        a.retain(|(e, p)| !(e == exe && *p == pid));
+        if listed {
+            a.push((exe.to_string(), pid));
+        }
+        a.retain(|(e, p)| *p == pid || !watch::is_gone(*p, e));
+    });
+    rules_changed(hwnd);
+}
+
+/// The rate the rules want for the programs now running: the most recently
+/// focused listed program's, else the default (`None` = leave the mouse be).
+fn rule_rate() -> Option<u16> {
+    let running = ACTIVE.with(|a| a.borrow().last().map(|(exe, _)| exe.clone()));
+    CFG.with(|c| {
+        let c = c.borrow();
+        match running {
+            Some(exe) => c.wanted_for(&exe),
+            None => c.default_rate(),
+        }
+    })
+}
+
+/// Event-driven path: if what the rules want differs from what they wanted
+/// last time (a listed program started or stopped), arm the one-shot timer
+/// that applies it. Nothing happens otherwise, so a rate picked by hand stays
+/// until the next start/stop.
+fn rules_changed(hwnd: HWND) {
     if !AUTO.with(Cell::get) {
         return;
     }
-    let hwnd = MAIN_HWND.load(Ordering::Relaxed) as HWND;
-    let (want, delay) = CFG.with(|c| {
-        let c = c.borrow();
-        (c.wanted_for(exe), c.delay_ms)
-    });
-    match want {
-        Some(hz) if hz != WANTED.with(Cell::get) => {
-            PENDING_AUTO.with(|p| p.set(hz));
-            // SAFETY: plain handle + id arguments; no callback pointer. Setting
-            // a timer that exists restarts it.
-            unsafe { SetTimer(hwnd, TIMER_AUTO, delay, None) };
-        }
-        _ => {
+    let Some(rate) = rule_rate() else {
+        RULE_RATE.with(|r| r.set(0));
+        return;
+    };
+    if rate == RULE_RATE.with(Cell::get) {
+        return;
+    }
+    RULE_RATE.with(|r| r.set(rate));
+    PENDING_AUTO.with(|p| p.set(rate));
+    let delay = CFG.with(|c| c.borrow().delay_ms);
+    // SAFETY: plain handle + id arguments; no callback pointer. Setting a
+    // timer that exists restarts it.
+    unsafe { SetTimer(hwnd, TIMER_AUTO, delay, None) };
+}
+
+/// Apply what the rules want right now, undoing any manual pick (menu switch
+/// turned on, or the `auto` hotkey).
+fn apply_rules_now(hwnd: HWND, announce: bool) {
+    match rule_rate() {
+        Some(rate) => {
+            RULE_RATE.with(|r| r.set(rate));
             // SAFETY: plain handle + id arguments.
             unsafe { KillTimer(hwnd, TIMER_AUTO) };
+            request_rate(hwnd, rate, announce);
+        }
+        // Nothing to apply (no listed program running and default = keep).
+        None => {
+            if announce {
+                sound::error(sound_mode());
+            }
         }
     }
 }
 
-/// Look at the program that has the focus right now (startup, reload, back to
-/// automatic mode).
+/// Which listed programs are already running (started before mousebatt, or
+/// before a reload). One process snapshot; never taken while a game runs.
+fn rescan_running() {
+    let names: Vec<String> = CFG.with(|c| c.borrow().apps.keys().cloned().collect());
+    let found = watch::find_running(&names);
+    ACTIVE.with(|a| *a.borrow_mut() = found);
+}
+
+/// Look at the program that has the focus right now (startup, reload).
 fn eval_foreground() {
     // SAFETY: no arguments.
     let hwnd = unsafe { GetForegroundWindow() };
-    if let Some(name) = watch::exe_name_of_window(hwnd) {
-        foreground_changed(&name);
+    if let Some((pid, exe)) = watch::process_of_window(hwnd) {
+        foreground_changed(pid, &exe);
     }
 }
 
@@ -684,7 +756,10 @@ fn reload_config(hwnd: HWND) {
     CFG.with(|c| *c.borrow_mut() = cfg);
     sync_hotkeys(hwnd);
     sync_hook();
+    rescan_running();
+    RULE_RATE.with(|r| r.set(0));
     eval_foreground();
+    rules_changed(hwnd);
     if WARNINGS.with(|w| !w.borrow().is_empty()) {
         // SAFETY: WMAPP_WARN carries no payload.
         unsafe { PostMessageW(hwnd, WMAPP_WARN, 0, 0) };
@@ -784,6 +859,29 @@ struct TrayView {
     text: String,
     color: u32,
     tip: String,
+    /// What the icon shows instead of the battery % in "polling rate" mode.
+    rate_text: Option<String>,
+}
+
+impl TrayView {
+    fn placeholder() -> TrayView {
+        TrayView {
+            text: "…".into(),
+            color: icon::COLOR_STALE,
+            tip: "mousebatt — reading…".into(),
+            rate_text: None,
+        }
+    }
+}
+
+/// Icon text for a polling rate: `1K`, `2K`, `4K`, `8K`, or the plain number
+/// (`125`, `250`, `500`). Never more than three characters.
+fn rate_label(hz: u16) -> String {
+    if hz >= 1000 && hz % 1000 == 0 {
+        format!("{}K", hz / 1000)
+    } else {
+        hz.to_string()
+    }
 }
 
 fn tray_view(result: &ReadResult, last_pct: Option<u8>) -> TrayView {
@@ -810,6 +908,7 @@ fn tray_view(result: &ReadResult, last_pct: Option<u8>) -> TrayView {
                 text: s.percent.to_string(),
                 color,
                 tip,
+                rate_text: s.polling.map(|p| rate_label(p.hz)),
             }
         }
         ReadResult::NoResponse(product) => match last_pct {
@@ -817,17 +916,20 @@ fn tray_view(result: &ReadResult, last_pct: Option<u8>) -> TrayView {
                 text: pct.to_string(),
                 color: icon::COLOR_STALE,
                 tip: format!("{} — {}% (stale, mouse not responding)", product, pct),
+                rate_text: None,
             },
             None => TrayView {
                 text: "?".into(),
                 color: icon::COLOR_STALE,
                 tip: format!("{} — not responding (asleep?)", product),
+                rate_text: None,
             },
         },
         ReadResult::NoDevice => TrayView {
             text: "?".into(),
             color: icon::COLOR_STALE,
             tip: "No supported mouse found".into(),
+            rate_text: None,
         },
     }
 }
@@ -841,15 +943,15 @@ fn base_nid(hwnd: HWND) -> NOTIFYICONDATAW {
     nid
 }
 
-fn update_tray(hwnd: HWND, text: &str, color: u32, tip: &str, add: bool) {
-    let new_icon = icon::battery_icon(text, color, GLYPH.with(Cell::get));
-    LAST_VIEW.with(|v| {
-        *v.borrow_mut() = Some(TrayView {
-            text: text.into(),
-            color,
-            tip: tip.into(),
-        })
-    });
+fn update_tray(hwnd: HWND, view: &TrayView, add: bool) {
+    let tip = view.tip.as_str();
+    // "Polling rate" mode draws 1K / 2K ... with no battery outline (it would
+    // describe the wrong number); everything else is the usual battery icon.
+    let new_icon = match (&view.rate_text, ICON_RATE.with(Cell::get)) {
+        (Some(rate), true) => icon::battery_icon(rate, view.color, BatteryGlyph::Hidden),
+        _ => icon::battery_icon(&view.text, view.color, GLYPH.with(Cell::get)),
+    };
+    LAST_VIEW.with(|v| *v.borrow_mut() = Some(view.clone()));
     let mut nid = base_nid(hwnd);
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WMAPP_TRAY;
@@ -874,7 +976,7 @@ fn update_tray(hwnd: HWND, text: &str, color: u32, tip: &str, add: bool) {
 /// changed, without waiting for the mouse.
 fn redraw_tray(hwnd: HWND) {
     if let Some(v) = LAST_VIEW.with(|v| v.borrow().clone()) {
-        update_tray(hwnd, &v.text, v.color, &v.tip, false);
+        update_tray(hwnd, &v, false);
     }
 }
 
@@ -890,6 +992,7 @@ fn show_menu(hwnd: HWND) {
     let polling = LAST_GOOD.with(|g| g.borrow().as_ref().and_then(|s| s.polling));
     let has_rules = CFG.with(|c| c.borrow().has_rules());
     let auto = AUTO.with(Cell::get);
+    let icon_rate = ICON_RATE.with(Cell::get);
     let mut pt = POINT { x: 0, y: 0 };
     // SAFETY: the menu (and the submenu it owns) is created and destroyed
     // within this block; every string temporary lives for the full statement
@@ -930,12 +1033,30 @@ fn show_menu(hwnd: HWND) {
             icon_sub as usize,
             wide("Battery icon").as_ptr(),
         );
+        let shows_sub = CreatePopupMenu();
+        for (i, label) in ["Battery level", "Polling rate"].into_iter().enumerate() {
+            AppendMenuW(
+                shows_sub,
+                MF_STRING | if (i == 1) == icon_rate { MF_CHECKED } else { 0 },
+                MENU_ICON_BASE + i,
+                wide(label).as_ptr(),
+            );
+        }
+        AppendMenuW(
+            menu,
+            MF_POPUP,
+            shows_sub as usize,
+            wide("Icon shows").as_ptr(),
+        );
         if has_rules {
+            // Checked = the rate follows the games listed in mousebatt.ini
+            // (it changes when one starts or closes). Unchecked = it only
+            // changes when you pick a rate yourself.
             AppendMenuW(
                 menu,
                 MF_STRING | if auto { MF_CHECKED } else { 0 },
                 MENU_AUTO,
-                wide("Automatic (mousebatt.ini rules)").as_ptr(),
+                wide("Switch rate automatically when a game runs").as_ptr(),
             );
         }
         AppendMenuW(
@@ -979,7 +1100,8 @@ fn show_menu(hwnd: HWND) {
         MENU_AUTO => {
             AUTO.with(|a| a.set(!auto));
             if !auto {
-                eval_foreground();
+                // Switched on: apply what the rules want for what runs now.
+                apply_rules_now(hwnd, false);
             }
         }
         MENU_EDIT_CFG => open_config(),
@@ -990,7 +1112,11 @@ fn show_menu(hwnd: HWND) {
             unsafe { PostQuitMessage(0) };
         }
         id => {
-            if let Some(&g) = id
+            if let Some(shows) = id.checked_sub(MENU_ICON_BASE).filter(|&i| i < 2) {
+                ICON_RATE.with(|c| c.set(shows == 1));
+                save_dword(ICON_VALUE, shows as u32);
+                redraw_tray(hwnd);
+            } else if let Some(&g) = id
                 .checked_sub(MENU_GLYPH_BASE)
                 .and_then(|i| BatteryGlyph::ALL.get(i))
             {
@@ -1036,9 +1162,8 @@ fn glyph_from_setting(value: u32) -> Option<BatteryGlyph> {
         .find(|&g| glyph_setting(g) == value)
 }
 
-/// The saved battery-icon choice, or the default if none (or an unknown one)
-/// is stored.
-fn load_glyph() -> BatteryGlyph {
+/// A REG_DWORD from the settings key, if present.
+fn load_dword(value: &str) -> Option<u32> {
     let mut data: u32 = 0;
     let mut size = size_of::<u32>() as u32;
     // SAFETY: the name temporaries live for the full statement, and
@@ -1047,35 +1172,46 @@ fn load_glyph() -> BatteryGlyph {
         RegGetValueW(
             HKEY_CURRENT_USER,
             wide(SETTINGS_KEY).as_ptr(),
-            wide(GLYPH_VALUE).as_ptr(),
+            wide(value).as_ptr(),
             RRF_RT_REG_DWORD,
             null_mut(),
             &mut data as *mut u32 as *mut c_void,
             &mut size,
         )
     };
-    if rc == 0 {
-        glyph_from_setting(data).unwrap_or(DEFAULT_GLYPH)
-    } else {
-        DEFAULT_GLYPH
-    }
+    (rc == 0).then_some(data)
 }
 
-fn save_glyph(g: BatteryGlyph) {
-    let data = glyph_setting(g);
+/// Store a REG_DWORD in the settings key (created if missing).
+fn save_dword(value: &str, data: u32) {
     // SAFETY: the name temporaries live for the full statement, and `data` is
-    // a 4-byte REG_DWORD that is copied. The key is created if missing.
+    // a 4-byte REG_DWORD that is copied.
     unsafe {
         RegSetKeyValueW(
             HKEY_CURRENT_USER,
             wide(SETTINGS_KEY).as_ptr(),
-            wide(GLYPH_VALUE).as_ptr(),
+            wide(value).as_ptr(),
             REG_DWORD,
             &data as *const u32 as *const c_void,
             size_of::<u32>() as u32,
         );
     }
 }
+
+/// The saved battery-icon choice, or the default if none (or an unknown one)
+/// is stored.
+fn load_glyph() -> BatteryGlyph {
+    load_dword(GLYPH_VALUE)
+        .and_then(glyph_from_setting)
+        .unwrap_or(DEFAULT_GLYPH)
+}
+
+fn save_glyph(g: BatteryGlyph) {
+    save_dword(GLYPH_VALUE, glyph_setting(g));
+}
+
+/// 0 = the icon shows the battery %, 1 = the polling rate.
+const ICON_VALUE: &str = "IconShows";
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_VALUE: &str = "MouseBatt";
@@ -1220,6 +1356,29 @@ mod tests {
         let v = tray_view(&ReadResult::NoResponse("X3".into()), None);
         assert_eq!(v.text, "?");
         assert_eq!(v.tip, "X3 — not responding (asleep?)");
+    }
+
+    #[test]
+    fn rate_labels_fit_the_icon() {
+        assert_eq!(rate_label(125), "125");
+        assert_eq!(rate_label(500), "500");
+        assert_eq!(rate_label(1000), "1K");
+        assert_eq!(rate_label(2000), "2K");
+        assert_eq!(rate_label(8000), "8K");
+    }
+
+    #[test]
+    fn ok_view_carries_the_rate_text() {
+        let mut r = status(85, false, None);
+        assert_eq!(tray_view(&r, None).rate_text, None);
+        if let ReadResult::Ok(s) = &mut r {
+            s.polling = Some(protocol::PollingInfo {
+                hz: 2000,
+                max_hz: 8000,
+                rates: &protocol::PULSAR_RATES,
+            });
+        }
+        assert_eq!(tray_view(&r, None).rate_text.as_deref(), Some("2K"));
     }
 
     #[test]

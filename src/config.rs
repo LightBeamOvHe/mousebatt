@@ -30,9 +30,9 @@ pub enum Fallback {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SoundMode {
     Off,
-    /// One short beep whose pitch rises with the rate.
+    /// A soft bell note whose pitch rises with the rate.
     Beep,
-    /// Spoken rate ("two thousand hertz"); `sounds\<hz>.wav` next to the exe
+    /// Spoken rate ("two thousand"); `sounds\<hz>.wav` next to the exe
     /// overrides the built-in clip.
     Voice,
 }
@@ -43,7 +43,7 @@ pub enum Action {
     Up,
     Down,
     Toggle(u16, u16),
-    /// Hand control back to the per-program rules.
+    /// Apply the rate the program rules want right now (undoes a manual pick).
     Auto,
 }
 
@@ -59,8 +59,8 @@ pub struct Hotkey {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub default: Fallback,
-    /// Wait this long after a window change before writing, so an alt-tab
-    /// that passes through other windows doesn't flap the rate.
+    /// Wait this long after a game starts or stops before writing, so a
+    /// short-lived process or a crash-and-relaunch doesn't flap the rate.
     pub delay_ms: u32,
     /// Re-apply the wanted rate when a periodic check finds another one.
     pub enforce: bool,
@@ -116,12 +116,18 @@ impl Config {
         !self.apps.is_empty() || self.default != Fallback::Keep
     }
 
-    /// The rate the per-program rules want while `exe` (lower-case file name)
-    /// has the focus; `None` = leave the mouse alone.
+    /// The rate the rules want while the listed program `exe` (lower-case file
+    /// name) is running; an unlisted name falls back to `default_rate`.
     pub fn wanted_for(&self, exe: &str) -> Option<u16> {
         if let Some(&hz) = self.apps.get(exe) {
             return Some(hz);
         }
+        self.default_rate()
+    }
+
+    /// The rate when no listed program is running; `None` = leave the mouse
+    /// alone.
+    pub fn default_rate(&self) -> Option<u16> {
         match self.default {
             Fallback::Keep => None,
             Fallback::Rate(hz) => Some(hz),
@@ -221,7 +227,7 @@ impl Config {
             },
             "sound" => match lower.as_str() {
                 "off" | "none" => self.sound = SoundMode::Off,
-                "beep" => self.sound = SoundMode::Beep,
+                "beep" | "chime" => self.sound = SoundMode::Beep,
                 "voice" => self.sound = SoundMode::Voice,
                 _ => self.warn(n, "sound must be off, beep or voice"),
             },
@@ -426,6 +432,13 @@ Ctrl+Shift+A = auto
         let keep = Config::parse("[apps]\ngame.exe = 2000\n");
         assert_eq!(keep.wanted_for("browser.exe"), None);
         assert!(keep.has_rules());
+    }
+
+    #[test]
+    fn default_rate_follows_the_default_setting() {
+        assert_eq!(Config::parse("[general]\ndefault = 2k\n").default_rate(), Some(2000));
+        assert_eq!(Config::parse("[general]\ndefault = keep\n").default_rate(), None);
+        assert_eq!(Config::parse("").default_rate(), None);
     }
 
     #[test]

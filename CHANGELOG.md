@@ -6,18 +6,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 ## [Unreleased]
 
 ### Added
-- **Per-program polling rates, hotkeys and sound feedback**, configured in `mousebatt.ini`
+- **Per-game polling rates, hotkeys and sound feedback**, configured in `mousebatt.ini`
   next to the exe (see `mousebatt.example.ini`; "Edit mousebatt.ini…" in the menu creates it):
-  - `[apps]` rules and a `default` rate, applied when a program gets the focus. Driven by
-    Windows focus-change events (`SetWinEventHook`, out of context): no timer, no scanning,
-    nothing injected into other programs. The hook only exists while the file has rules.
+  - `[apps]` rules and a `default` rate. A listed program counts as running from the first
+    time its window gets the focus until it exits; its rate holds whatever has the focus, so
+    alt-tabbing writes nothing to the mouse. Driven by Windows focus-change events
+    (`SetWinEventHook`, out of context): no timer, no scanning, nothing injected into other
+    programs. One process snapshot at startup / reload finds games already running. The hook
+    only exists while the file has rules.
   - Global hotkeys (`RegisterHotKey`, no keyboard hook): set a rate, step up/down, toggle two
-    rates, or return to automatic mode.
+    rates, or apply the rules now. A manual pick holds until a listed program starts or closes.
   - Every change is read back from the mouse and re-sent if it didn't take (3 tries), with
     retries after 3 s / 10 s / 30 s when the mouse is asleep. `enforce = true` also puts the
     wanted rate back when the periodic check finds another one.
-  - Optional sound once the mouse has confirmed the rate: a pitch-coded beep or a spoken rate
-    (built-in English clips, overridable with `sounds\<hz>.wav`).
+  - Optional sound once the mouse has confirmed the rate: a soft bell note or the spoken
+    number (built-in English clips, overridable with `sounds\<hz>.wav`).
+- Tray menu: "Icon shows > Battery level / Polling rate" (1K, 2K, 4K, 8K, 500, ...) and a
+  clearer "Switch rate automatically when a game runs" switch.
 - The poll worker clears its in-flight flag before posting its result, so a rate requested
   while a poll was running can no longer be dropped.
 - **Battery icon** submenu in the right-click menu: show a small battery glyph, filled to
