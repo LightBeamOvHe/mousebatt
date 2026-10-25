@@ -11,19 +11,22 @@
 //! the few programs we are tracking get one cheap "is it gone?" check (one
 //! `OpenProcess`), which is how a closed game is noticed. The only full
 //! process listing is `find_running`, used once at startup / config reload.
+use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, BOOLEAN, HANDLE, HWND, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
 };
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW,
+    GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, RegisterWaitForSingleObject,
+    UnregisterWait,
 };
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, PostMessageW};
 
 const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
@@ -32,6 +35,14 @@ const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 const STILL_ACTIVE: u32 = 259;
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const INFINITE: u32 = 0xFFFF_FFFF;
+const WT_EXECUTEONLYONCE: u32 = 0x0000_0008;
+
+/// Where `watch_exit` notifications go: the window and message set by
+/// `set_exit_notification`.
+static EXIT_HWND: AtomicUsize = AtomicUsize::new(0);
+static EXIT_MSG: AtomicU32 = AtomicU32::new(0);
 
 /// Signature Windows expects for a WinEvent callback.
 pub type ForegroundProc = unsafe extern "system" fn(
@@ -170,4 +181,65 @@ pub fn find_running(names: &[String]) -> Vec<(String, u32)> {
     // SAFETY: `snap` is a handle we own and close exactly once.
     unsafe { CloseHandle(snap) };
     found
+}
+
+/// Windows will post message `msg` (with the process id as `WPARAM`) to window
+/// `hwnd` whenever a process registered with `watch_exit` ends.
+pub fn set_exit_notification(hwnd: usize, msg: u32) {
+    EXIT_HWND.store(hwnd, Ordering::Relaxed);
+    EXIT_MSG.store(msg, Ordering::Relaxed);
+}
+
+/// Runs on a thread-pool thread of the process when a watched process ends.
+unsafe extern "system" fn on_exit(context: *mut c_void, _timed_out: BOOLEAN) {
+    let hwnd = EXIT_HWND.load(Ordering::Relaxed);
+    if hwnd != 0 {
+        // SAFETY: PostMessageW only reads its arguments; if the window is gone
+        // the call just fails. `context` is the process id, not a pointer.
+        unsafe { PostMessageW(hwnd as HWND, EXIT_MSG.load(Ordering::Relaxed), context as usize, 0) };
+    }
+}
+
+/// Ask Windows to tell us when process `pid` ends: no polling, no timer, the
+/// notification arrives the moment the process is gone. Needs a handle with
+/// the minimal wait right (SYNCHRONIZE), kept open until `stop_watching`;
+/// holding it also guarantees the id can't be reused by another program.
+/// Returns (process handle, wait handle) as integers, or `None` if Windows
+/// refuses (the caller then falls back to occasional re-checks).
+pub fn watch_exit(pid: u32) -> Option<(usize, usize)> {
+    // SAFETY: plain integer arguments.
+    let process = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut wait: HANDLE = null_mut();
+    // SAFETY: `wait` is a valid out-pointer; `process` is the handle opened
+    // above; `on_exit` is a plain function and the context is the process id.
+    let ok = unsafe {
+        RegisterWaitForSingleObject(
+            &mut wait,
+            process,
+            Some(on_exit),
+            pid as usize as *const c_void,
+            INFINITE,
+            WT_EXECUTEONLYONCE,
+        )
+    };
+    if ok == 0 {
+        // SAFETY: `process` is a handle we own and close exactly once.
+        unsafe { CloseHandle(process) };
+        return None;
+    }
+    Some((process as usize, wait as usize))
+}
+
+/// Release what `watch_exit` returned (also fine after the process ended).
+pub fn stop_watching(process: usize, wait: usize) {
+    // SAFETY: both values come from a successful `watch_exit` and are released
+    // once. The wait is unregistered first (without blocking), then the
+    // process handle it used is closed.
+    unsafe {
+        UnregisterWait(wait as HANDLE);
+        CloseHandle(process as HANDLE);
+    }
 }

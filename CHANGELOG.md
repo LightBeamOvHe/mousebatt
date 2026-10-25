@@ -29,6 +29,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 - `pause_in_game` (Settings > Options): while a game runs, the periodic and device-change reads
   of the mouse are skipped, so nothing touches the mouse during play; one read catches up when
   the last game ends. Rate changes are never skipped.
+- A program that exits is noticed the moment it ends, through a Windows wait on its process
+  (`RegisterWaitForSingleObject`, no polling): the desktop rate comes back right after a game
+  closes, whatever window has the focus. Before, it was only noticed at the next focus change.
+  If Windows refuses the wait for some program, up to four re-checks, four seconds apart, are
+  made instead.
 - Tray menu: "Icon shows > Battery level / Polling rate / Both" (1K, 2K, 4K, 8K, 500, ...;
   "Both" stacks battery % over the rate in smaller digits) and a clearer "Switch rate
   automatically when a game runs" switch.

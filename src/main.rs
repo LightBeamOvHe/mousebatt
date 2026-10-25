@@ -16,6 +16,7 @@ mod ui;
 mod watch;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -60,6 +61,8 @@ const WMAPP_TRAY: u32 = WM_APP + 1;
 const WMAPP_POLLDONE: u32 = WM_APP + 2;
 const WMAPP_REDRAW: u32 = WM_APP + 3;
 const WMAPP_WARN: u32 = WM_APP + 4;
+/// Posted by Windows (through `watch`) when a tracked program exits.
+const WMAPP_PROCESS_EXIT: u32 = WM_APP + 8;
 const TIMER_POLL: usize = 1;
 const TIMER_DEBOUNCE: usize = 2;
 const TIMER_THEME: usize = 3;
@@ -68,6 +71,9 @@ const TIMER_THEME: usize = 3;
 const TIMER_AUTO: usize = 4;
 /// One-shot: another try at a rate the mouse didn't confirm (asleep, lost write).
 const TIMER_RETRY: usize = 5;
+/// One-shot, only for a tracked program Windows would not let us watch: look
+/// again whether it has exited (a few times, a few seconds apart).
+const TIMER_RECHECK: usize = 6;
 const MENU_REFRESH: usize = 1;
 const MENU_AUTOSTART: usize = 2;
 const MENU_EXIT: usize = 3;
@@ -143,6 +149,10 @@ thread_local! {
     /// (0 = none). A manual pick doesn't touch it, so the rules only act again
     /// when a listed program starts or stops.
     static RULE_RATE: Cell<u16> = const { Cell::new(0) };
+    /// Exit watches on the programs in `ACTIVE`: process id -> (process handle,
+    /// wait handle).
+    static WATCHES: RefCell<HashMap<u32, (usize, usize)>> = RefCell::new(HashMap::new());
+    static RECHECK_LEFT: Cell<u8> = const { Cell::new(0) };
     /// What the tray icon shows: 0 = battery %, 1 = polling rate, 2 = both
     /// (battery over rate, smaller).
     static ICON_SHOWS: Cell<u8> = const { Cell::new(0) };
@@ -219,6 +229,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_CREATE => {
             MAIN_HWND.store(hwnd as usize, Ordering::Relaxed);
+            watch::set_exit_notification(hwnd as usize, WMAPP_PROCESS_EXIT);
             ICON_SHOWS.with(|c| c.set(load_dword(ICON_VALUE).map_or(0, |v| v.min(2) as u8)));
             update_tray(hwnd, &TrayView::placeholder(), true);
             // SAFETY: plain handle + id arguments; no callback pointer.
@@ -255,6 +266,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let announce = CFG.with(|c| c.borrow().sound_auto);
                     request_rate(hwnd, hz, announce);
                 }
+            } else if wparam == TIMER_RECHECK {
+                // SAFETY: plain handle + id arguments.
+                unsafe { KillTimer(hwnd, TIMER_RECHECK) };
+                recheck(hwnd);
             } else if wparam == TIMER_RETRY {
                 // SAFETY: plain handle + id arguments.
                 unsafe { KillTimer(hwnd, TIMER_RETRY) };
@@ -264,6 +279,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_HOTKEY => {
             on_hotkey(hwnd, wparam);
+            0
+        }
+        WMAPP_PROCESS_EXIT => {
+            on_process_exit(hwnd, wparam as u32);
             0
         }
         WMAPP_WARN => {
@@ -702,11 +721,89 @@ fn foreground_changed(pid: u32, exe: &str, path: &str) {
         }
         a.retain(|(e, p)| *p == pid || !watch::is_gone(*p, e));
     });
+    if sync_watches() {
+        arm_recheck(hwnd);
+    }
     // The last game just ended: the reads that were skipped catch up now.
     if was_playing && !paused_for_game() {
         start_poll(hwnd);
     }
     rules_changed(hwnd);
+}
+
+/// Windows told us that process `pid` ended (it was registered by
+/// `sync_watches`): forget it at once and let the rules react. This is what
+/// brings the desktop rate back right after you close a game, whatever
+/// window you are in.
+fn on_process_exit(hwnd: HWND, pid: u32) {
+    let was_playing = paused_for_game();
+    ACTIVE.with(|a| a.borrow_mut().retain(|(_, p)| *p != pid));
+    sync_watches();
+    if was_playing && !paused_for_game() {
+        start_poll(hwnd);
+    }
+    rules_changed(hwnd);
+}
+
+/// Keep exactly one exit watch per program in `ACTIVE`: start the missing
+/// ones, release the ones no longer needed. Returns true if Windows refused
+/// to let us watch some program (the caller then falls back to a few
+/// re-checks a little later).
+fn sync_watches() -> bool {
+    let pids: Vec<u32> = ACTIVE.with(|a| a.borrow().iter().map(|(_, p)| *p).collect());
+    let stale: Vec<u32> = WATCHES.with(|w| {
+        w.borrow()
+            .keys()
+            .copied()
+            .filter(|p| !pids.contains(p))
+            .collect()
+    });
+    for pid in stale {
+        if let Some((process, wait)) = WATCHES.with(|w| w.borrow_mut().remove(&pid)) {
+            watch::stop_watching(process, wait);
+        }
+    }
+    let mut unwatched = false;
+    for pid in pids {
+        if WATCHES.with(|w| w.borrow().contains_key(&pid)) {
+            continue;
+        }
+        match watch::watch_exit(pid) {
+            Some(entry) => {
+                WATCHES.with(|w| w.borrow_mut().insert(pid, entry));
+            }
+            None => unwatched = true,
+        }
+    }
+    unwatched
+}
+
+/// Start the bounded series of re-checks for a program we could not watch.
+fn arm_recheck(hwnd: HWND) {
+    RECHECK_LEFT.with(|c| c.set(4));
+    // SAFETY: plain handle + id arguments; no callback pointer.
+    unsafe { SetTimer(hwnd, TIMER_RECHECK, 4_000, None) };
+}
+
+/// Fallback for programs we could not watch: has one exited? Looks again up
+/// to four times, four seconds apart, then leaves it to the next focus change.
+fn recheck(hwnd: HWND) {
+    let was_playing = paused_for_game();
+    ACTIVE.with(|a| a.borrow_mut().retain(|(e, p)| !watch::is_gone(*p, e)));
+    let still_unwatched = sync_watches();
+    if was_playing && !paused_for_game() {
+        start_poll(hwnd);
+    }
+    rules_changed(hwnd);
+    let left = RECHECK_LEFT.with(|c| {
+        let n = c.get().saturating_sub(1);
+        c.set(n);
+        n
+    });
+    if left > 0 && still_unwatched {
+        // SAFETY: plain handle + id arguments; no callback pointer.
+        unsafe { SetTimer(hwnd, TIMER_RECHECK, 4_000, None) };
+    }
 }
 
 /// True while a game runs and `pause_in_game` is on: the periodic and
@@ -778,6 +875,9 @@ fn rescan_running() {
     let names: Vec<String> = CFG.with(|c| c.borrow().apps.keys().cloned().collect());
     let found = watch::find_running(&names);
     ACTIVE.with(|a| *a.borrow_mut() = found);
+    if sync_watches() {
+        arm_recheck(MAIN_HWND.load(Ordering::Relaxed) as HWND);
+    }
 }
 
 /// Look at the program that has the focus right now (startup, reload).
