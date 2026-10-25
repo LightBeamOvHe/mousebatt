@@ -233,12 +233,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // slept (and woke) while the system stayed up: no
                 // WM_DEVICECHANGE or power broadcast is sent for that, so
                 // without this the tray would sit stale until a manual
-                // refresh.
-                start_poll(hwnd);
+                // refresh. (Skipped while a game runs if `pause_in_game` is on.)
+                if !paused_for_game() {
+                    start_poll(hwnd);
+                }
             } else if wparam == TIMER_DEBOUNCE {
                 // SAFETY: plain handle + id arguments.
                 unsafe { KillTimer(hwnd, TIMER_DEBOUNCE) };
-                start_poll(hwnd);
+                if !paused_for_game() {
+                    start_poll(hwnd);
+                }
             } else if wparam == TIMER_THEME {
                 // SAFETY: plain handle + id arguments.
                 unsafe { KillTimer(hwnd, TIMER_THEME) };
@@ -671,29 +675,46 @@ unsafe extern "system" fn on_foreground(
     _event_thread: u32,
     _event_time: u32,
 ) {
-    if let Some((pid, exe)) = watch::process_of_window(hwnd) {
-        foreground_changed(pid, &exe);
+    if let Some((pid, exe, path)) = watch::process_of_window(hwnd) {
+        foreground_changed(pid, &exe, &path);
     }
 }
 
-/// The program `exe` (process `pid`) just got the focus. If it is a listed
-/// program it now counts as running, whatever has the focus later; programs
-/// we were tracking that have exited are dropped. Then the rules are looked
-/// at again. Moving between other windows changes nothing here, so alt-tabbing
-/// away from a game (or watching a video elsewhere) never writes to the mouse.
-fn foreground_changed(pid: u32, exe: &str) {
+/// The program `exe` (process `pid`, installed at `path`) just got the focus.
+/// If it is a listed program, or a game recognised by its install folder, it
+/// now counts as running whatever has the focus later; programs we were
+/// tracking that have exited are dropped. Then the rules are looked at again.
+/// Moving between other windows changes nothing here, so alt-tabbing away from
+/// a game (or watching a video elsewhere) never writes to the mouse.
+fn foreground_changed(pid: u32, exe: &str, path: &str) {
     let hwnd = MAIN_HWND.load(Ordering::Relaxed) as HWND;
-    let listed = CFG.with(|c| c.borrow().apps.contains_key(exe));
+    let counts = CFG.with(|c| {
+        let c = c.borrow();
+        c.apps.contains_key(exe) || c.is_game_path(path, exe)
+    });
+    let was_playing = paused_for_game();
     ACTIVE.with(|a| {
         let mut a = a.borrow_mut();
         // Re-adding moves it to the end: the last one is the most recent.
         a.retain(|(e, p)| !(e == exe && *p == pid));
-        if listed {
+        if counts {
             a.push((exe.to_string(), pid));
         }
         a.retain(|(e, p)| *p == pid || !watch::is_gone(*p, e));
     });
+    // The last game just ended: the reads that were skipped catch up now.
+    if was_playing && !paused_for_game() {
+        start_poll(hwnd);
+    }
     rules_changed(hwnd);
+}
+
+/// True while a game runs and `pause_in_game` is on: the periodic and
+/// device-change reads of the mouse are then skipped, so nothing at all
+/// touches the mouse during play. Rate changes (game start / stop, hotkeys)
+/// are never skipped.
+fn paused_for_game() -> bool {
+    CFG.with(|c| c.borrow().pause_in_game) && ACTIVE.with(|a| !a.borrow().is_empty())
 }
 
 /// The rate the rules want for the programs now running: the most recently
@@ -763,8 +784,8 @@ fn rescan_running() {
 fn eval_foreground() {
     // SAFETY: no arguments.
     let hwnd = unsafe { GetForegroundWindow() };
-    if let Some((pid, exe)) = watch::process_of_window(hwnd) {
-        foreground_changed(pid, &exe);
+    if let Some((pid, exe, path)) = watch::process_of_window(hwnd) {
+        foreground_changed(pid, &exe, &path);
     }
 }
 

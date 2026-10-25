@@ -72,8 +72,8 @@ pub fn uninstall(hook: usize) {
     }
 }
 
-/// Lower-cased file name of the program behind an open process handle.
-fn image_name(process: HANDLE) -> Option<String> {
+/// Lower-cased full path of the program behind an open process handle.
+fn image_path(process: HANDLE) -> Option<String> {
     let mut buf = [0u16; 1024];
     let mut len = buf.len() as u32;
     // SAFETY: `buf` holds `len` u16s; `process` is a valid open handle.
@@ -81,15 +81,18 @@ fn image_name(process: HANDLE) -> Option<String> {
     if ok == 0 {
         return None;
     }
-    let path = String::from_utf16_lossy(&buf[..len as usize]);
-    let file = path.rsplit(['\\', '/']).next()?;
-    Some(file.to_lowercase())
+    Some(String::from_utf16_lossy(&buf[..len as usize]).to_lowercase())
 }
 
-/// Process id and lower-cased file name (`discovery.exe`) of the program that
-/// owns `hwnd`. `None` if Windows refuses the query; callers treat that as
-/// "don't touch the mouse".
-pub fn process_of_window(hwnd: HWND) -> Option<(u32, String)> {
+/// The file name at the end of a path (`c:\games\x\x.exe` -> `x.exe`).
+fn file_name(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+/// Process id, lower-cased file name (`discovery.exe`) and lower-cased full
+/// path of the program that owns `hwnd`. `None` if Windows refuses the query;
+/// callers treat that as "don't touch the mouse".
+pub fn process_of_window(hwnd: HWND) -> Option<(u32, String, String)> {
     let mut pid: u32 = 0;
     // SAFETY: `pid` is a valid out-pointer.
     unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
@@ -104,10 +107,10 @@ pub fn process_of_window(hwnd: HWND) -> Option<(u32, String)> {
     if process.is_null() {
         return None;
     }
-    let name = image_name(process);
+    let path = image_path(process);
     // SAFETY: `process` is a handle we own and close exactly once.
     unsafe { CloseHandle(process) };
-    name.map(|n| (pid, n))
+    path.map(|p| (pid, file_name(&p).to_string(), p))
 }
 
 /// True only when process `pid` is certainly no longer the program `exe`:
@@ -124,7 +127,7 @@ pub fn is_gone(pid: u32, exe: &str) -> bool {
     let mut code: u32 = 0;
     // SAFETY: `code` is a valid out-pointer; `process` is a valid handle.
     let got_code = unsafe { GetExitCodeProcess(process, &mut code) } != 0;
-    let name = image_name(process);
+    let name = image_path(process).map(|p| file_name(&p).to_string());
     // SAFETY: `process` is a handle we own and close exactly once.
     unsafe { CloseHandle(process) };
     if got_code && code != STILL_ACTIVE {

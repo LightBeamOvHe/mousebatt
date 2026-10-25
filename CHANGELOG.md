@@ -21,12 +21,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
     wanted rate back when the periodic check finds another one.
   - Optional sound once the mouse has confirmed the rate: a soft bell note or the spoken
     number (built-in English clips, overridable with `sounds\<hz>.wav`).
+- **Games recognised by their install folder**: `game_rate` (and optional `game_folders`) give
+  every program installed under a Steam / Epic / GOG / Xbox / Riot / Ubisoft / EA folder that
+  rate when it takes the focus, so only the exceptions need to be listed in `[apps]`.
+  Launchers are ignored; a program listed in `[apps]` always wins. No scanning: the install
+  path comes with the focus event that is already handled.
+- `pause_in_game` (Settings > Options): while a game runs, the periodic and device-change reads
+  of the mouse are skipped, so nothing touches the mouse during play; one read catches up when
+  the last game ends. Rate changes are never skipped.
 - Tray menu: "Icon shows > Battery level / Polling rate / Both" (1K, 2K, 4K, 8K, 500, ...;
   "Both" stacks battery % over the rate in smaller digits) and a clearer "Switch rate
   automatically when a game runs" switch.
 - **Settings window** (tray menu > Settings…): desktop rate, games with their rates (picked from
-  the programs running now, or typed), hotkeys entered by pressing the keys, sound and
-  enforce options. Save rewrites `mousebatt.ini` (comments of a hand-edited file are not kept;
+  the programs running now, or typed), any number of hotkeys (a list with + Add / − Remove, the
+  keys entered by pressing them), sound and enforce options. Save rewrites `mousebatt.ini` (comments of a hand-edited file are not kept;
   presets and the delay are) and reloads it; the real hotkeys are suspended while it is open.
   A small `build.rs` embeds `mousebatt.manifest` so the window uses the modern control style.
 - The poll worker clears its in-flight flag before posting its result, so a rate requested

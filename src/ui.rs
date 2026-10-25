@@ -35,10 +35,8 @@ pub const MSG_RESUME_HOTKEYS: u32 = WM_APP + 6;
 pub const MSG_RELOAD_CONFIG: u32 = WM_APP + 7;
 
 const CLASS: &str = "mousebatt_settings_wnd";
-/// Hotkey rows in the window. Extra hotkeys already in the file are kept.
-const SLOTS: usize = 6;
 const CLIENT_W: i32 = 540;
-const CLIENT_H: i32 = 640;
+const CLIENT_H: i32 = 618;
 
 // Control ids.
 const ID_SAVE: i32 = 1; // IDOK: Enter
@@ -52,8 +50,13 @@ const ID_REMOVE: i32 = 106;
 const ID_SOUND: i32 = 107;
 const ID_SOUNDAUTO: i32 = 108;
 const ID_ENFORCE: i32 = 109;
-/// Row `i`: action list = base + 2i, hotkey box = base + 2i + 1.
-const ID_SLOT_BASE: i32 = 200;
+const ID_GAMEDEFAULT: i32 = 110;
+const ID_PAUSE: i32 = 111;
+const ID_HKLIST: i32 = 120;
+const ID_HKACTION: i32 = 121;
+const ID_HKKEY: i32 = 122;
+const ID_HKADD: i32 = 123;
+const ID_HKREMOVE: i32 = 124;
 
 // Window messages and styles (stable Win32 values).
 const WM_COMMAND: u32 = 0x0111;
@@ -116,12 +119,17 @@ struct Handles {
     win: usize,
     font: usize,
     desktop: usize,
+    gamedefault: usize,
     program: usize,
     gamerate: usize,
     list: usize,
     sound: usize,
     sound_auto: usize,
     enforce: usize,
+    pause: usize,
+    hk_list: usize,
+    hk_action: usize,
+    hk_key: usize,
 }
 
 struct Ui {
@@ -133,11 +141,9 @@ struct Ui {
     apps: Vec<(String, u16)>,
     /// What the hotkey drop-downs offer, in order (`None` = not used).
     actions: Vec<Option<Action>>,
-    /// Hotkeys of the file the window can't show (Win key, or more than
-    /// `SLOTS`): kept and written back as they are.
-    extra_hotkeys: Vec<Hotkey>,
-    /// (action drop-down, hotkey box) per row.
-    slots: Vec<(usize, usize)>,
+    /// The hotkeys in the list, in order. The Win key can't be typed into the
+    /// hotkey box, but a combination that uses it stays in the file.
+    hotkeys: Vec<Hotkey>,
 }
 
 thread_local! {
@@ -283,7 +289,9 @@ fn action_list(base: &Config) -> Vec<Option<Action>> {
     v.extend(PULSAR_RATES.iter().map(|&hz| Some(Action::Set(hz))));
     v.push(Some(Action::Up));
     v.push(Some(Action::Down));
-    v.push(Some(Action::Toggle(1000, 2000)));
+    for (a, b) in [(500, 1000), (1000, 2000), (500, 2000)] {
+        v.push(Some(Action::Toggle(a, b)));
+    }
     v.push(Some(Action::Auto));
     for h in &base.hotkeys {
         let a = Some(h.action.clone());
@@ -292,6 +300,12 @@ fn action_list(base: &Config) -> Vec<Option<Action>> {
         }
     }
     v
+}
+
+/// One line of the hotkey list: `Ctrl+Shift+P      Set 2000 Hz`.
+fn hotkey_line(hk: &Hotkey) -> String {
+    let combo = config::fmt_hotkey(hk.mods, hk.vk).unwrap_or_else(|| hk.label.clone());
+    format!("{combo}      {}", action_label(&Some(hk.action.clone())))
 }
 
 fn game_label(name: &str, hz: u16) -> String {
@@ -414,129 +428,113 @@ fn build(win: HWND, main: usize, dpi: i32, font: usize, base: Config) -> Ui {
     let c = |class: &str, text: &str, style: u32, id: i32, r: [i32; 4]| {
         child(win, class, text, style, id, r, dpi, font)
     };
+    let combo_style = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
 
-    c("BUTTON", "Rate when no listed game is running", BS_GROUPBOX, 0, [10, 8, 520, 54]);
-    c("STATIC", "Desktop rate:", 0, 0, [24, 30, 110, 18]);
-    let desktop = c(
-        "COMBOBOX",
-        "",
-        CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
-        ID_DESKTOP,
-        [140, 26, 170, 200],
+    c("BUTTON", "Rates", BS_GROUPBOX, 0, [10, 8, 520, 100]);
+    c("STATIC", "Desktop (no game running):", 0, 0, [24, 32, 200, 18]);
+    let desktop = c("COMBOBOX", "", combo_style, ID_DESKTOP, [232, 28, 170, 200]);
+    c("STATIC", "Other games (detected):", 0, 0, [24, 62, 200, 18]);
+    let gamedefault = c("COMBOBOX", "", combo_style, ID_GAMEDEFAULT, [232, 58, 170, 200]);
+    c(
+        "STATIC",
+        "Recognised by install folder: Steam, Epic, GOG, Xbox, Riot, Ubisoft, EA.",
+        0,
+        0,
+        [24, 84, 494, 18],
     );
 
     c(
         "BUTTON",
-        "Games: the rate holds while the program runs",
+        "Games with their own rate (they win over the above)",
         BS_GROUPBOX,
         0,
-        [10, 70, 520, 212],
+        [10, 116, 520, 170],
     );
-    c("STATIC", "Program:", 0, 0, [24, 96, 56, 18]);
+    c("STATIC", "Program:", 0, 0, [24, 142, 56, 18]);
     let program = c(
         "COMBOBOX",
         "",
         CBS_DROPDOWN | WS_VSCROLL | WS_TABSTOP,
         ID_PROGRAM,
-        [82, 92, 196, 220],
+        [82, 138, 196, 220],
     );
-    c("STATIC", "Rate:", 0, 0, [288, 96, 32, 18]);
-    let gamerate = c(
-        "COMBOBOX",
-        "",
-        CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
-        ID_GAMERATE,
-        [322, 92, 86, 200],
-    );
-    c("BUTTON", "Add / update", WS_TABSTOP, ID_ADD, [414, 91, 104, 24]);
-    let list = c(
-        "LISTBOX",
-        "",
-        WS_BORDER | LBS_NOTIFY | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | WS_TABSTOP,
-        ID_LIST,
-        [24, 124, 494, 110],
-    );
-    c("BUTTON", "Remove", WS_TABSTOP, ID_REMOVE, [24, 242, 100, 24]);
+    c("STATIC", "Rate:", 0, 0, [288, 142, 32, 18]);
+    let gamerate = c("COMBOBOX", "", combo_style, ID_GAMERATE, [322, 138, 86, 200]);
+    c("BUTTON", "+ Add / update", WS_TABSTOP, ID_ADD, [414, 137, 104, 24]);
+    let list_style = WS_BORDER | LBS_NOTIFY | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | WS_TABSTOP;
+    let list = c("LISTBOX", "", list_style, ID_LIST, [24, 170, 494, 70]);
+    c("BUTTON", "\u{2212} Remove", WS_TABSTOP, ID_REMOVE, [24, 248, 100, 24]);
     c(
         "STATIC",
         "Pick a program that is running, or type its file name (Task Manager > Details).",
         0,
         0,
-        [134, 238, 384, 36],
+        [134, 246, 384, 32],
     );
 
     c(
         "BUTTON",
-        "Hotkeys: click a box, then press the keys",
+        "Hotkeys (as many as you like)",
         BS_GROUPBOX,
         0,
-        [10, 290, 520, 208],
+        [10, 294, 520, 162],
     );
-    let mut slots = Vec::new();
-    for i in 0..SLOTS {
-        let y = 316 + 30 * i as i32;
-        let combo = c(
-            "COMBOBOX",
-            "",
-            CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
-            ID_SLOT_BASE + 2 * i as i32,
-            [24, y, 250, 200],
-        );
-        let key = c(
-            "msctls_hotkey32",
-            "",
-            WS_BORDER | WS_TABSTOP,
-            ID_SLOT_BASE + 2 * i as i32 + 1,
-            [284, y + 1, 234, 22],
-        );
-        slots.push((combo, key));
-    }
-
-    c("BUTTON", "Options", BS_GROUPBOX, 0, [10, 506, 520, 82]);
-    c("STATIC", "Sound:", 0, 0, [24, 532, 50, 18]);
-    let sound = c(
-        "COMBOBOX",
+    let hk_list = c("LISTBOX", "", list_style, ID_HKLIST, [24, 320, 494, 64]);
+    let hk_action = c("COMBOBOX", "", combo_style, ID_HKACTION, [24, 392, 236, 200]);
+    let hk_key = c(
+        "msctls_hotkey32",
         "",
-        CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
-        ID_SOUND,
-        [78, 528, 150, 200],
+        WS_BORDER | WS_TABSTOP,
+        ID_HKKEY,
+        [268, 393, 146, 22],
     );
+    c("BUTTON", "+ Add / update", WS_TABSTOP, ID_HKADD, [420, 391, 98, 24]);
+    c("BUTTON", "\u{2212} Remove", WS_TABSTOP, ID_HKREMOVE, [24, 424, 100, 24]);
+    c(
+        "STATIC",
+        "Pick an action, click the box, press the keys, then + Add. Select a hotkey to change it.",
+        0,
+        0,
+        [134, 422, 384, 32],
+    );
+
+    c("BUTTON", "Options", BS_GROUPBOX, 0, [10, 464, 520, 106]);
+    c("STATIC", "Sound:", 0, 0, [24, 490, 50, 18]);
+    let sound = c("COMBOBOX", "", combo_style, ID_SOUND, [78, 486, 150, 200]);
     let sound_auto = c(
         "BUTTON",
         "Also for automatic changes",
         BS_AUTOCHECKBOX | WS_TABSTOP,
         ID_SOUNDAUTO,
-        [244, 530, 274, 20],
+        [244, 488, 274, 20],
     );
     let enforce = c(
         "BUTTON",
         "Put the rate back if another tool changes it",
         BS_AUTOCHECKBOX | WS_TABSTOP,
         ID_ENFORCE,
-        [24, 558, 494, 20],
+        [24, 516, 494, 20],
+    );
+    let pause = c(
+        "BUTTON",
+        "Don't read the mouse while a game runs (battery display waits)",
+        BS_AUTOCHECKBOX | WS_TABSTOP,
+        ID_PAUSE,
+        [24, 542, 494, 20],
     );
     c(
         "BUTTON",
         "Save",
         BS_DEFPUSHBUTTON | WS_TABSTOP,
         ID_SAVE,
-        [330, 598, 100, 28],
+        [330, 580, 100, 28],
     );
-    c("BUTTON", "Cancel", WS_TABSTOP, ID_CANCEL, [440, 598, 90, 28]);
+    c("BUTTON", "Cancel", WS_TABSTOP, ID_CANCEL, [440, 580, 90, 28]);
 
     let mut apps: Vec<(String, u16)> = base.apps.iter().map(|(k, &v)| (k.clone(), v)).collect();
     apps.sort();
     let actions = action_list(&base);
-    // The hotkeys the boxes can show go in rows; the others are kept as is.
-    let mut extra_hotkeys = Vec::new();
-    let mut shown = 0;
-    for hk in &base.hotkeys {
-        if hk.mods & MOD_WIN == 0 && shown < SLOTS {
-            shown += 1;
-        } else {
-            extra_hotkeys.push(hk.clone());
-        }
-    }
+    let hotkeys = base.hotkeys.clone();
 
     Ui {
         h: Handles {
@@ -544,31 +542,35 @@ fn build(win: HWND, main: usize, dpi: i32, font: usize, base: Config) -> Ui {
             win: win as usize,
             font,
             desktop,
+            gamedefault,
             program,
             gamerate,
             list,
             sound,
             sound_auto,
             enforce,
+            pause,
+            hk_list,
+            hk_action,
+            hk_key,
         },
         base,
         apps,
         actions,
-        extra_hotkeys,
-        slots,
+        hotkeys,
     }
 }
 
 /// Put the loaded settings into the controls.
 fn populate() {
-    let Some((h, base, apps, actions, slots)) = UI.with(|u| {
+    let Some((h, base, apps, actions, hotkeys)) = UI.with(|u| {
         u.borrow().as_ref().map(|u| {
             (
                 u.h,
                 u.base.clone(),
                 u.apps.clone(),
                 u.actions.clone(),
-                u.slots.clone(),
+                u.hotkeys.clone(),
             )
         })
     }) else {
@@ -583,30 +585,29 @@ fn populate() {
     };
     fill_combo(h.desktop, &desktop_items, desktop_sel);
 
+    let mut game_items = vec!["Off (don't detect games)".to_string()];
+    game_items.extend(rate_names());
+    let game_sel = base
+        .game_rate
+        .and_then(|hz| PULSAR_RATES.iter().position(|&r| r == hz))
+        .map_or(0, |i| i + 1);
+    fill_combo(h.gamedefault, &game_items, game_sel);
+
     let fast = PULSAR_RATES.iter().position(|&r| r == 2000).unwrap_or(0);
     fill_combo(h.gamerate, &rate_names(), fast);
     refresh_programs(&h);
     refill_list(&h, &apps);
 
     let labels: Vec<String> = actions.iter().map(action_label).collect();
-    let shown: Vec<&Hotkey> = base
-        .hotkeys
-        .iter()
-        .filter(|hk| hk.mods & MOD_WIN == 0)
-        .take(SLOTS)
-        .collect();
-    for (i, &(combo, key)) in slots.iter().enumerate() {
-        let hk = shown.get(i);
-        let sel = hk
-            .and_then(|hk| actions.iter().position(|a| a.as_ref() == Some(&hk.action)))
-            .unwrap_or(0);
-        fill_combo(combo, &labels, sel);
-        // Require a modifier; a bare key gets Ctrl+Alt in front.
-        send(key, HKM_SETRULES, HKCOMB_NONE | HKCOMB_S, (HOTKEYF_CONTROL | HOTKEYF_ALT) as isize);
-        if let Some(hk) = hk {
-            send(key, HKM_SETHOTKEY, (to_box(hk.mods) << 8) | hk.vk as usize, 0);
-        }
-    }
+    fill_combo(h.hk_action, &labels, 0);
+    // Require a modifier; a bare key gets Ctrl+Alt in front.
+    send(
+        h.hk_key,
+        HKM_SETRULES,
+        HKCOMB_NONE | HKCOMB_S,
+        (HOTKEYF_CONTROL | HOTKEYF_ALT) as isize,
+    );
+    refill_hotkeys(&h, &hotkeys);
 
     let sounds = ["Off", "Soft beep", "Spoken number"].map(String::from);
     let sound_sel = match base.sound {
@@ -617,6 +618,15 @@ fn populate() {
     fill_combo(h.sound, &sounds, sound_sel);
     send(h.sound_auto, BM_SETCHECK, usize::from(base.sound_auto), 0);
     send(h.enforce, BM_SETCHECK, usize::from(base.enforce), 0);
+    send(h.pause, BM_SETCHECK, usize::from(base.pause_in_game), 0);
+}
+
+fn refill_hotkeys(h: &Handles, hotkeys: &[Hotkey]) {
+    send(h.hk_list, LB_RESETCONTENT, 0, 0);
+    for hk in hotkeys {
+        add_str(h.hk_list, LB_ADDSTRING, &hotkey_line(hk));
+    }
+    send(h.hk_list, LB_SETCURSEL, usize::MAX, 0); // nothing selected
 }
 
 fn refill_list(h: &Handles, apps: &[(String, u16)]) {
@@ -690,6 +700,9 @@ fn on_command(id: i32, code: u32) {
         (ID_ADD, BN_CLICKED) => on_add(),
         (ID_REMOVE, BN_CLICKED) => on_remove(),
         (ID_LIST, LBN_SELCHANGE) => on_list_select(),
+        (ID_HKADD, BN_CLICKED) => on_hotkey_add(),
+        (ID_HKREMOVE, BN_CLICKED) => on_hotkey_remove(),
+        (ID_HKLIST, LBN_SELCHANGE) => on_hotkey_select(),
         (ID_PROGRAM, CBN_DROPDOWN) => {
             if let Some(h) = handles() {
                 refresh_programs(&h);
@@ -763,11 +776,102 @@ fn on_list_select() {
     }
 }
 
+/// "+ Add / update" for hotkeys: the action and keys chosen above the button.
+/// A hotkey with the same keys is replaced.
+fn on_hotkey_add() {
+    let Some(h) = handles() else { return };
+    let action = UI.with(|u| {
+        let u = u.borrow();
+        let ui = u.as_ref()?;
+        usize::try_from(send(h.hk_action, CB_GETCURSEL, 0, 0))
+            .ok()
+            .and_then(|i| ui.actions.get(i))
+            .cloned()
+            .flatten()
+    });
+    let Some(action) = action else {
+        message(h.win, "Choose what the hotkey should do.", MB_ICONWARNING);
+        return;
+    };
+    let keys = send(h.hk_key, HKM_GETHOTKEY, 0, 0) as u32;
+    let (vk, mods) = (keys & 0xFF, from_box((keys >> 8) & 0xFF));
+    if vk == 0 {
+        message(h.win, "Click the key box and press the keys.", MB_ICONWARNING);
+        return;
+    }
+    let Some(label) = config::fmt_hotkey(mods, vk) else {
+        message(h.win, "That key is not supported.", MB_ICONWARNING);
+        return;
+    };
+    let hotkeys = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        let ui = u.as_mut()?;
+        let hk = Hotkey {
+            mods,
+            vk,
+            action,
+            label,
+        };
+        match ui.hotkeys.iter_mut().find(|e| e.mods == mods && e.vk == vk) {
+            Some(existing) => *existing = hk,
+            None => ui.hotkeys.push(hk),
+        }
+        Some(ui.hotkeys.clone())
+    });
+    if let Some(hotkeys) = hotkeys {
+        refill_hotkeys(&h, &hotkeys);
+    }
+}
+
+fn on_hotkey_remove() {
+    let Some(h) = handles() else { return };
+    let Ok(sel) = usize::try_from(send(h.hk_list, LB_GETCURSEL, 0, 0)) else {
+        return;
+    };
+    let hotkeys = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        let ui = u.as_mut()?;
+        if sel < ui.hotkeys.len() {
+            ui.hotkeys.remove(sel);
+        }
+        Some(ui.hotkeys.clone())
+    });
+    if let Some(hotkeys) = hotkeys {
+        refill_hotkeys(&h, &hotkeys);
+    }
+}
+
+/// A hotkey picked in the list: show its action and keys above, ready to be
+/// changed with "+ Add / update".
+fn on_hotkey_select() {
+    let Some(h) = handles() else { return };
+    let Ok(sel) = usize::try_from(send(h.hk_list, LB_GETCURSEL, 0, 0)) else {
+        return;
+    };
+    let picked = UI.with(|u| {
+        let u = u.borrow();
+        let ui = u.as_ref()?;
+        let hk = ui.hotkeys.get(sel)?.clone();
+        let pos = ui.actions.iter().position(|a| a.as_ref() == Some(&hk.action));
+        Some((hk, pos))
+    });
+    if let Some((hk, pos)) = picked {
+        send(h.hk_action, CB_SETCURSEL, pos.unwrap_or(0), 0);
+        // The box can't show a combination that uses the Win key.
+        let keys = if hk.mods & MOD_WIN == 0 {
+            (to_box(hk.mods) << 8) | hk.vk as usize
+        } else {
+            0
+        };
+        send(h.hk_key, HKM_SETHOTKEY, keys, 0);
+    }
+}
+
 unsafe extern "system" fn enum_windows(hwnd: HWND, _lparam: LPARAM) -> BOOL {
     // SAFETY: plain window-handle queries.
     let titled = unsafe { IsWindowVisible(hwnd) != 0 && GetWindowTextLengthW(hwnd) > 0 };
     if titled {
-        if let Some((_, name)) = watch::process_of_window(hwnd) {
+        if let Some((_, name, _)) = watch::process_of_window(hwnd) {
             FOUND.with(|f| f.borrow_mut().push(name));
         }
     }
@@ -814,6 +918,10 @@ fn collect(ui: &Ui) -> Result<Config, String> {
         },
         _ => Fallback::Keep,
     };
+    cfg.game_rate = usize::try_from(send(h.gamedefault, CB_GETCURSEL, 0, 0))
+        .ok()
+        .filter(|&i| i > 0)
+        .and_then(|i| PULSAR_RATES.get(i - 1).copied());
     cfg.apps = ui.apps.iter().cloned().collect::<HashMap<_, _>>();
     cfg.sound = match send(h.sound, CB_GETCURSEL, 0, 0) {
         1 => SoundMode::Beep,
@@ -822,42 +930,9 @@ fn collect(ui: &Ui) -> Result<Config, String> {
     };
     cfg.sound_auto = send(h.sound_auto, BM_GETCHECK, 0, 0) == 1;
     cfg.enforce = send(h.enforce, BM_GETCHECK, 0, 0) == 1;
+    cfg.pause_in_game = send(h.pause, BM_GETCHECK, 0, 0) == 1;
 
-    cfg.hotkeys.clear();
-    let mut seen: Vec<String> = Vec::new();
-    for (i, &(combo, key)) in ui.slots.iter().enumerate() {
-        let row = i + 1;
-        let action = usize::try_from(send(combo, CB_GETCURSEL, 0, 0))
-            .ok()
-            .and_then(|a| ui.actions.get(a))
-            .cloned()
-            .flatten();
-        let keys = send(key, HKM_GETHOTKEY, 0, 0) as u32;
-        let vk = keys & 0xFF;
-        let mods = from_box((keys >> 8) & 0xFF);
-        match (action, vk) {
-            (None, 0) => continue,
-            (None, _) => return Err(format!("Hotkey {row}: choose what it should do.")),
-            (Some(_), 0) => {
-                return Err(format!("Hotkey {row}: click its box and press the keys."))
-            }
-            (Some(action), vk) => {
-                let label = config::fmt_hotkey(mods, vk)
-                    .ok_or_else(|| format!("Hotkey {row}: that key is not supported."))?;
-                if seen.contains(&label) {
-                    return Err(format!("{label} is used twice."));
-                }
-                seen.push(label.clone());
-                cfg.hotkeys.push(Hotkey {
-                    mods,
-                    vk,
-                    action,
-                    label,
-                });
-            }
-        }
-    }
-    cfg.hotkeys.extend(ui.extra_hotkeys.iter().cloned());
+    cfg.hotkeys = ui.hotkeys.clone();
     Ok(cfg)
 }
 
@@ -884,17 +959,12 @@ fn save() {
 /// box are left alone (Enter or Esc may be part of the combination), except
 /// Tab, which still moves on.
 pub fn dialog_message(msg: &MSG) -> bool {
-    let Some((win, keys)) = UI.with(|u| {
-        u.borrow()
-            .as_ref()
-            .map(|u| (u.h.win, u.slots.iter().map(|s| s.1).collect::<Vec<_>>()))
-    }) else {
+    let Some((win, key)) = UI.with(|u| u.borrow().as_ref().map(|u| (u.h.win, u.h.hk_key))) else {
         return false;
     };
     // SAFETY: no arguments.
     let focus = unsafe { GetFocus() } as usize;
-    let in_hotkey_box = keys.contains(&focus);
-    if in_hotkey_box && !(msg.message == WM_KEYDOWN && msg.wParam == VK_TAB) {
+    if focus == key && !(msg.message == WM_KEYDOWN && msg.wParam == VK_TAB) {
         return false;
     }
     // SAFETY: `win` is our live window and `msg` a valid MSG.

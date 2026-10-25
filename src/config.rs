@@ -11,6 +11,37 @@ use std::path::PathBuf;
 
 use crate::protocol::PULSAR_RATES;
 
+/// Where games usually live; a program whose path contains one of these is
+/// treated as a game (when `game_rate` is set). Lower-case.
+pub const DEFAULT_GAME_FOLDERS: &[&str] = &[
+    "\\steamapps\\common\\",
+    "\\epic games\\",
+    "\\gog galaxy\\games\\",
+    "\\gog games\\",
+    "\\xboxgames\\",
+    "\\riot games\\",
+    "\\ubisoft game launcher\\games\\",
+    "\\ea games\\",
+];
+
+/// Launchers and helpers that sit in those folders (or next to them) but are
+/// never the game. An explicit `[apps]` rule still wins over this list.
+const LAUNCHERS: &[&str] = &[
+    "steam.exe",
+    "steamwebhelper.exe",
+    "epicgameslauncher.exe",
+    "epicwebhelper.exe",
+    "galaxyclient.exe",
+    "eadesktop.exe",
+    "eabackgroundservice.exe",
+    "battle.net.exe",
+    "upc.exe",
+    "ubisoftconnect.exe",
+    "riotclientservices.exe",
+    "riotclientux.exe",
+    "riotclientuxrender.exe",
+];
+
 /// Commented example written by "Edit mousebatt.ini" when no file exists yet.
 pub const TEMPLATE: &str = include_str!("../mousebatt.example.ini");
 
@@ -67,6 +98,16 @@ pub struct Config {
     pub sound: SoundMode,
     /// Also play the sound for changes made by the per-program rules.
     pub sound_auto: bool,
+    /// While a game runs, skip the periodic and device-change reads of the
+    /// mouse, so nothing at all is done during play (the battery display
+    /// simply stays as it was until the game ends).
+    pub pause_in_game: bool,
+    /// Rate for a program recognised as a game by where it is installed but
+    /// not listed in `apps`; `None` = don't recognise games.
+    pub game_rate: Option<u16>,
+    /// Folder fragments (lower-case, backslashes) that mark a game; empty =
+    /// `DEFAULT_GAME_FOLDERS`.
+    pub game_folders: Vec<String>,
     /// Lower-cased program file name -> rate.
     pub apps: HashMap<String, u16>,
     /// Named rates, sorted by name. Only read by hand-edited files, but kept
@@ -84,6 +125,9 @@ impl Default for Config {
             enforce: false,
             sound: SoundMode::Off,
             sound_auto: false,
+            pause_in_game: false,
+            game_rate: None,
+            game_folders: Vec::new(),
             apps: HashMap::new(),
             presets: Vec::new(),
             hotkeys: Vec::new(),
@@ -117,16 +161,30 @@ pub fn load() -> Config {
 impl Config {
     /// True when something in the file needs the foreground hook.
     pub fn has_rules(&self) -> bool {
-        !self.apps.is_empty() || self.default != Fallback::Keep
+        !self.apps.is_empty() || self.default != Fallback::Keep || self.game_rate.is_some()
     }
 
-    /// The rate the rules want while the listed program `exe` (lower-case file
-    /// name) is running; an unlisted name falls back to `default_rate`.
+    /// Is the program at `path` (lower-case) named `exe` (lower-case) a game
+    /// by where it is installed? Always false while `game_rate` is off.
+    pub fn is_game_path(&self, path: &str, exe: &str) -> bool {
+        if self.game_rate.is_none() || LAUNCHERS.contains(&exe) {
+            return false;
+        }
+        if self.game_folders.is_empty() {
+            DEFAULT_GAME_FOLDERS.iter().any(|f| path.contains(f))
+        } else {
+            self.game_folders.iter().any(|f| path.contains(f.as_str()))
+        }
+    }
+
+    /// The rate the rules want while the program `exe` (lower-case file name)
+    /// runs: its own rule, else the rate for games recognised by their folder,
+    /// else the default.
     pub fn wanted_for(&self, exe: &str) -> Option<u16> {
         if let Some(&hz) = self.apps.get(exe) {
             return Some(hz);
         }
-        self.default_rate()
+        self.game_rate.or_else(|| self.default_rate())
     }
 
     /// The rate when no listed program is running; `None` = leave the mouse
@@ -242,6 +300,26 @@ impl Config {
                 Some(b) => self.sound_auto = b,
                 None => self.warn(n, "sound_auto must be true or false"),
             },
+            "pause_in_game" => match parse_bool(&lower) {
+                Some(b) => self.pause_in_game = b,
+                None => self.warn(n, "pause_in_game must be true or false"),
+            },
+            "game_rate" => {
+                if matches!(lower.as_str(), "off" | "none") {
+                    self.game_rate = None;
+                } else if let Some(hz) = parse_rate(value, presets) {
+                    self.game_rate = Some(hz);
+                } else {
+                    self.warn(n, "game_rate must be `off`, a rate or a preset");
+                }
+            }
+            "game_folders" => {
+                self.game_folders = value
+                    .split('|')
+                    .map(|f| f.trim().to_lowercase().replace('/', "\\"))
+                    .filter(|f| !f.is_empty())
+                    .collect();
+            }
             other => self.warn(n, &format!("unknown setting `{other}`")),
         }
     }
@@ -275,6 +353,14 @@ impl Config {
             SoundMode::Voice => "sound = voice\n",
         });
         out.push_str(&format!("sound_auto = {}\n", self.sound_auto));
+        out.push_str(&format!("pause_in_game = {}\n", self.pause_in_game));
+        match self.game_rate {
+            None => out.push_str("game_rate = off\n"),
+            Some(hz) => out.push_str(&format!("game_rate = {hz}\n")),
+        }
+        if !self.game_folders.is_empty() {
+            out.push_str(&format!("game_folders = {}\n", self.game_folders.join(" | ")));
+        }
         if !self.presets.is_empty() {
             out.push_str("\n[presets]\n");
             for (name, hz) in &self.presets {
@@ -490,6 +576,9 @@ delay_ms = 2000
 enforce = yes
 sound = voice
 sound_auto = true
+pause_in_game = true
+game_rate = 1000
+game_folders = \\steamapps\\common\\ | d:\\games\\
 
 [presets]
 fast = 2000
@@ -546,6 +635,40 @@ Ctrl+Shift+A = auto
     }
 
     #[test]
+    fn game_detection_by_folder() {
+        let cfg = Config::parse("[general]\ngame_rate = 1000\n");
+        assert!(cfg.is_game_path(r"d:\steamlibrary\steamapps\common\hades\hades.exe", "hades.exe"));
+        assert!(cfg.is_game_path(
+            r"c:\program files\epic games\fortnite\fortniteclient.exe",
+            "fortniteclient.exe"
+        ));
+        assert!(!cfg.is_game_path(
+            r"c:\program files (x86)\epic games\launcher\portal\epicgameslauncher.exe",
+            "epicgameslauncher.exe"
+        ));
+        assert!(!cfg.is_game_path(r"c:\program files\mozilla firefox\firefox.exe", "firefox.exe"));
+        // Off unless a game rate is set.
+        let off = Config::parse("");
+        assert!(!off.is_game_path(r"d:\steamapps\common\x\x.exe", "x.exe"));
+        // A custom folder list replaces the built-in one.
+        let custom = Config::parse("[general]\ngame_rate = 500\ngame_folders = D:\\Games\\ | /Emulators/\n");
+        assert!(custom.is_game_path(r"d:\games\foo\foo.exe", "foo.exe"));
+        assert!(custom.is_game_path(r"c:\emulators\bar\bar.exe", "bar.exe"));
+        assert!(!custom.is_game_path(r"d:\steamapps\common\x\x.exe", "x.exe"));
+    }
+
+    #[test]
+    fn detected_games_get_the_game_rate() {
+        let cfg = Config::parse(
+            "[general]\ndefault = 500\ngame_rate = 1000\n[apps]\nthefinals.exe = 2000\n",
+        );
+        assert_eq!(cfg.wanted_for("thefinals.exe"), Some(2000));
+        assert_eq!(cfg.wanted_for("hades.exe"), Some(1000));
+        assert_eq!(cfg.default_rate(), Some(500));
+        assert!(Config::parse("[general]\ngame_rate = 1000\n").has_rules());
+    }
+
+    #[test]
     fn default_rate_follows_the_default_setting() {
         assert_eq!(Config::parse("[general]\ndefault = 2k\n").default_rate(), Some(2000));
         assert_eq!(Config::parse("[general]\ndefault = keep\n").default_rate(), None);
@@ -594,6 +717,9 @@ Ctrl+Shift+A = auto
         assert_eq!(again.enforce, cfg.enforce);
         assert_eq!(again.sound, cfg.sound);
         assert_eq!(again.sound_auto, cfg.sound_auto);
+        assert!(again.pause_in_game && cfg.pause_in_game);
+        assert_eq!(again.game_rate, cfg.game_rate);
+        assert_eq!(again.game_folders, cfg.game_folders);
         assert_eq!(again.apps, cfg.apps);
         assert_eq!(again.presets, cfg.presets);
         assert_eq!(again.hotkeys.len(), cfg.hotkeys.len());
