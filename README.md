@@ -1,3 +1,13 @@
+# This fork was only made for me and my own usage with a Pulsar X2 Crazylight.
+I am not a developper, I used Claude to add what I wanted to add, credits to the original author of the program.
+
+Basically added a way to automatically change the mouse frequency to a specified setting when an indicated program is running in the background. The frequency doesn't change when alt-tabbing, so the program doesn't write too much in the memory.
+* Added the possibility to program keybinds to modify said frequency manually on the fly.
+* Added the possibility to customize the status bar icon with a battery icon, frequency indicator, or both at the same time.
+* Added sounds (beeps or some TTS clips, you can also add your own sounds if you want) that can trigger whenever the frequency is changed with a keybind, they can also trigger if the frequency is changing automatically.
+* You can choose to disable any kind of automatic behavior.
+
+
 # mousebatt
 
 A tiny Windows system-tray battery monitor for Pulsar and VAXEE wireless gaming mice.
