@@ -24,9 +24,34 @@ pub const DEFAULT_GAME_FOLDERS: &[&str] = &[
     "\\ea games\\",
 ];
 
+/// Programs that start games, for the "started by a game launcher" detection.
+const LAUNCHER_PARENTS: &[&str] = &[
+    "steam.exe",
+    "epicgameslauncher.exe",
+    "playnite.desktopapp.exe",
+    "playnite.fullscreenapp.exe",
+    "galaxyclient.exe",
+    "eadesktop.exe",
+    "upc.exe",
+    "ubisoftconnect.exe",
+    "battle.net.exe",
+    "riotclientservices.exe",
+    "heroic.exe",
+    "itch.exe",
+    "amazon games.exe",
+];
+
 /// Launchers and helpers that sit in those folders (or next to them) but are
 /// never the game. An explicit `[apps]` rule still wins over this list.
 const LAUNCHERS: &[&str] = &[
+    "playnite.desktopapp.exe",
+    "playnite.fullscreenapp.exe",
+    "cefsharp.browsersubprocess.exe",
+    "gameoverlayui.exe",
+    "steamerrorreporter.exe",
+    "heroic.exe",
+    "itch.exe",
+    "amazon games.exe",
     "steam.exe",
     "steamwebhelper.exe",
     "epicgameslauncher.exe",
@@ -105,9 +130,21 @@ pub struct Config {
     /// Rate for a program recognised as a game by where it is installed but
     /// not listed in `apps`; `None` = don't recognise games.
     pub game_rate: Option<u16>,
-    /// Folder fragments (lower-case, backslashes) that mark a game; empty =
-    /// `DEFAULT_GAME_FOLDERS`.
+    /// Your own game folders (lower-case, backslashes, trailing `\`): every
+    /// program inside one counts as a game. They add to the built-in list.
     pub game_folders: Vec<String>,
+    /// Also use the built-in folders (`DEFAULT_GAME_FOLDERS`).
+    pub builtin_game_folders: bool,
+    /// Also use the folders of the games the Epic launcher reports as
+    /// installed (read when the file is loaded, never saved).
+    pub epic_library: bool,
+    /// Epic's install folders, filled by `load()` when `epic_library` is on.
+    pub epic_folders: Vec<String>,
+    /// Also count a program started by a game launcher (Playnite, Steam, Epic,
+    /// ...) as a game, wherever it is installed. Less precise: off by default.
+    pub launcher_games: bool,
+    /// Launchers to recognise besides the built-in ones (lower-case names).
+    pub game_launchers: Vec<String>,
     /// Lower-cased program file name -> rate.
     pub apps: HashMap<String, u16>,
     /// Named rates, sorted by name. Only read by hand-edited files, but kept
@@ -128,6 +165,11 @@ impl Default for Config {
             pause_in_game: false,
             game_rate: None,
             game_folders: Vec::new(),
+            builtin_game_folders: true,
+            epic_library: true,
+            epic_folders: Vec::new(),
+            launcher_games: false,
+            game_launchers: Vec::new(),
             apps: HashMap::new(),
             presets: Vec::new(),
             hotkeys: Vec::new(),
@@ -145,7 +187,7 @@ pub fn path() -> PathBuf {
 
 /// Read `mousebatt.ini`; a missing file is not an error.
 pub fn load() -> Config {
-    match std::fs::read_to_string(path()) {
+    let mut cfg = match std::fs::read_to_string(path()) {
         Ok(text) => Config::parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(e) => {
@@ -155,7 +197,113 @@ pub fn load() -> Config {
             ));
             cfg
         }
+    };
+    if cfg.epic_library && cfg.game_rate.is_some() {
+        cfg.epic_folders = epic_install_folders();
     }
+    cfg
+}
+
+/// A folder as stored: lower-case, backslashes, one trailing backslash, so
+/// `D:/Jeux` becomes `d:\jeux\` and cannot match `d:\jeux2\`.
+pub fn normalize_folder(folder: &str) -> String {
+    let mut f = folder.trim().to_lowercase().replace('/', "\\");
+    if !f.is_empty() && !f.ends_with('\\') {
+        f.push('\\');
+    }
+    f
+}
+
+/// The folders where the Epic Games launcher says games are installed. Read
+/// from its own files (`LauncherInstalled.dat` and the manifests), so a game
+/// installed anywhere, such as `C:\Jeux\Fortnite`, is found. Called when the
+/// settings are loaded, never while a game runs.
+pub fn epic_install_folders() -> Vec<String> {
+    let Some(data) = std::env::var_os("ProgramData") else {
+        return Vec::new();
+    };
+    let base = PathBuf::from(data).join("Epic");
+    let mut folders = Vec::new();
+    let installed = base.join("UnrealEngineLauncher").join("LauncherInstalled.dat");
+    if let Ok(text) = std::fs::read_to_string(installed) {
+        folders.extend(parse_epic_locations(&text));
+    }
+    let manifests = base.join("EpicGamesLauncher").join("Data").join("Manifests");
+    if let Ok(entries) = std::fs::read_dir(manifests) {
+        for entry in entries.flatten() {
+            let file = entry.path();
+            if file.extension().is_some_and(|e| e.eq_ignore_ascii_case("item")) {
+                if let Ok(text) = std::fs::read_to_string(&file) {
+                    folders.extend(parse_epic_locations(&text));
+                }
+            }
+        }
+    }
+    folders.sort();
+    folders.dedup();
+    folders
+}
+
+/// Every `"InstallLocation"` of an Epic JSON file, as normalised folders.
+/// Unreal Engine installs (`UE_5.x`, not games) are left out.
+pub fn parse_epic_locations(text: &str) -> Vec<String> {
+    const KEY: &str = "\"InstallLocation\"";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(KEY) {
+        let after = &rest[i + KEY.len()..];
+        let Some((location, used)) = json_string_after_colon(after) else {
+            rest = after;
+            continue;
+        };
+        let object = &after[..after.find('}').unwrap_or(after.len())];
+        let engine_name = json_value_of(object, "AppName")
+            .or_else(|| json_value_of(object, "ArtifactId"))
+            .is_some_and(|n| n.to_ascii_lowercase().starts_with("ue_"));
+        let folder = normalize_folder(&location);
+        let engine_dir = folder
+            .trim_end_matches('\\')
+            .rsplit('\\')
+            .next()
+            .is_some_and(|last| last.starts_with("ue_"));
+        if !folder.is_empty() && !engine_name && !engine_dir {
+            out.push(folder);
+        }
+        rest = &after[used.min(after.len())..];
+    }
+    out
+}
+
+/// The value of `"key"` inside a flat piece of JSON text.
+fn json_value_of(object: &str, key: &str) -> Option<String> {
+    let at = object.find(&format!("\"{key}\""))?;
+    json_string_after_colon(&object[at + key.len() + 2..]).map(|(v, _)| v)
+}
+
+/// `: "text"` -> (text with the usual escapes decoded, bytes used).
+fn json_string_after_colon(s: &str) -> Option<(String, usize)> {
+    let trimmed = s.trim_start();
+    let mut pos = s.len() - trimmed.len();
+    let after_colon = trimmed.strip_prefix(':')?;
+    let body = after_colon.trim_start();
+    pos += 1 + (after_colon.len() - body.len());
+    let mut chars = body.char_indices();
+    if chars.next()?.1 != '"' {
+        return None;
+    }
+    let mut value = String::new();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((value, pos + i + 1)),
+            '\\' => match chars.next()?.1 {
+                'n' => value.push('\n'),
+                't' => value.push('\t'),
+                other => value.push(other), // \\ \" \/ and anything else
+            },
+            other => value.push(other),
+        }
+    }
+    None
 }
 
 impl Config {
@@ -170,11 +318,19 @@ impl Config {
         if self.game_rate.is_none() || LAUNCHERS.contains(&exe) {
             return false;
         }
-        if self.game_folders.is_empty() {
-            DEFAULT_GAME_FOLDERS.iter().any(|f| path.contains(f))
-        } else {
-            self.game_folders.iter().any(|f| path.contains(f.as_str()))
-        }
+        (self.builtin_game_folders && DEFAULT_GAME_FOLDERS.iter().any(|f| path.contains(f)))
+            || self.game_folders.iter().any(|f| path.contains(f.as_str()))
+            || self.epic_folders.iter().any(|f| path.contains(f.as_str()))
+    }
+
+    /// Never counted as a game, whatever else says so (launchers and helpers).
+    pub fn is_never_game(&self, exe: &str) -> bool {
+        LAUNCHERS.contains(&exe)
+    }
+
+    /// Is `exe` a game launcher (for the "started by a game launcher" check)?
+    pub fn is_launcher(&self, exe: &str) -> bool {
+        LAUNCHER_PARENTS.contains(&exe) || self.game_launchers.iter().any(|l| l == exe)
     }
 
     /// The rate the rules want while the program `exe` (lower-case file name)
@@ -316,8 +472,28 @@ impl Config {
             "game_folders" => {
                 self.game_folders = value
                     .split('|')
-                    .map(|f| f.trim().to_lowercase().replace('/', "\\"))
+                    .map(normalize_folder)
                     .filter(|f| !f.is_empty())
+                    .collect();
+            }
+            "builtin_game_folders" => match parse_bool(&lower) {
+                Some(b) => self.builtin_game_folders = b,
+                None => self.warn(n, "builtin_game_folders must be true or false"),
+            },
+            "epic_library" => match parse_bool(&lower) {
+                Some(b) => self.epic_library = b,
+                None => self.warn(n, "epic_library must be true or false"),
+            },
+            "launcher_games" => match parse_bool(&lower) {
+                Some(b) => self.launcher_games = b,
+                None => self.warn(n, "launcher_games must be true or false"),
+            },
+            "game_launchers" => {
+                self.game_launchers = value
+                    .split('|')
+                    .map(|n| n.trim())
+                    .filter(|n| !n.is_empty())
+                    .map(normalize_exe)
                     .collect();
             }
             other => self.warn(n, &format!("unknown setting `{other}`")),
@@ -358,8 +534,17 @@ impl Config {
             None => out.push_str("game_rate = off\n"),
             Some(hz) => out.push_str(&format!("game_rate = {hz}\n")),
         }
+        out.push_str(&format!(
+            "builtin_game_folders = {}\n",
+            self.builtin_game_folders
+        ));
         if !self.game_folders.is_empty() {
             out.push_str(&format!("game_folders = {}\n", self.game_folders.join(" | ")));
+        }
+        out.push_str(&format!("epic_library = {}\n", self.epic_library));
+        out.push_str(&format!("launcher_games = {}\n", self.launcher_games));
+        if !self.game_launchers.is_empty() {
+            out.push_str(&format!("game_launchers = {}\n", self.game_launchers.join(" | ")));
         }
         if !self.presets.is_empty() {
             out.push_str("\n[presets]\n");
@@ -579,6 +764,10 @@ sound_auto = true
 pause_in_game = true
 game_rate = 1000
 game_folders = \\steamapps\\common\\ | d:\\games\\
+builtin_game_folders = false
+epic_library = false
+launcher_games = true
+game_launchers = MyLauncher.exe | other
 
 [presets]
 fast = 2000
@@ -650,11 +839,49 @@ Ctrl+Shift+A = auto
         // Off unless a game rate is set.
         let off = Config::parse("");
         assert!(!off.is_game_path(r"d:\steamapps\common\x\x.exe", "x.exe"));
-        // A custom folder list replaces the built-in one.
-        let custom = Config::parse("[general]\ngame_rate = 500\ngame_folders = D:\\Games\\ | /Emulators/\n");
+        // Custom folders can be used alone (built-in list switched off).
+        let custom = Config::parse("[general]\ngame_rate = 500\ngame_folders = D:\\Games | /Emulators/\nbuiltin_game_folders = false\n");
         assert!(custom.is_game_path(r"d:\games\foo\foo.exe", "foo.exe"));
         assert!(custom.is_game_path(r"c:\emulators\bar\bar.exe", "bar.exe"));
         assert!(!custom.is_game_path(r"d:\steamapps\common\x\x.exe", "x.exe"));
+    }
+
+    #[test]
+    fn custom_folders_add_to_the_builtin_ones() {
+        let cfg = Config::parse("[general]\ngame_rate = 1000\ngame_folders = C:/Jeux\n");
+        assert_eq!(cfg.game_folders, [r"c:\jeux\"]);
+        assert!(cfg.is_game_path(r"c:\jeux\fortnite\fortniteclient-win64-shipping.exe", "fortniteclient-win64-shipping.exe"));
+        // The built-in folders still count...
+        assert!(cfg.is_game_path(r"d:\steamapps\common\x\x.exe", "x.exe"));
+        // ...a folder with a similar name does not.
+        assert!(!cfg.is_game_path(r"c:\jeux2\x\x.exe", "x.exe"));
+    }
+
+    #[test]
+    fn epic_install_locations_are_read_without_engines() {
+        let dat = r#"{
+            "InstallationList": [
+                { "InstallLocation": "C:\\Jeux\\Fortnite", "NamespaceId": "fn",
+                  "AppName": "Fortnite" },
+                { "InstallLocation": "D:\\Epic Games\\UE_5.3", "NamespaceId": "ue",
+                  "ArtifactId": "UE_5.3", "AppName": "UE_5.3" },
+                { "InstallLocation": "D:/Autre/Jeu", "AppName": "Jeu" }
+            ]
+        }"#;
+        assert_eq!(parse_epic_locations(dat), [r"c:\jeux\fortnite\", r"d:\autre\jeu\"]);
+        assert!(parse_epic_locations("not json at all").is_empty());
+    }
+
+    #[test]
+    fn epic_folders_and_launchers_are_used_when_set() {
+        let mut cfg = Config::parse("[general]\ngame_rate = 1000\n");
+        cfg.epic_folders = parse_epic_locations(r#"{"InstallLocation": "C:\\Jeux\\Fortnite"}"#);
+        assert!(cfg.is_game_path(r"c:\jeux\fortnite\fortniteclient.exe", "fortniteclient.exe"));
+        assert!(cfg.is_launcher("playnite.desktopapp.exe"));
+        assert!(cfg.is_launcher("epicgameslauncher.exe"));
+        assert!(!cfg.is_launcher("chrome.exe"));
+        assert!(cfg.is_never_game("playnite.fullscreenapp.exe"));
+        assert!(!cfg.is_game_path(r"c:\jeux\x\playnite.desktopapp.exe", "playnite.desktopapp.exe"));
     }
 
     #[test]
@@ -720,6 +947,12 @@ Ctrl+Shift+A = auto
         assert!(again.pause_in_game && cfg.pause_in_game);
         assert_eq!(again.game_rate, cfg.game_rate);
         assert_eq!(again.game_folders, cfg.game_folders);
+        assert_eq!(again.builtin_game_folders, cfg.builtin_game_folders);
+        assert_eq!(again.epic_library, cfg.epic_library);
+        assert_eq!(again.launcher_games, cfg.launcher_games);
+        assert_eq!(again.game_launchers, cfg.game_launchers);
+        assert!(cfg.launcher_games && !cfg.epic_library && !cfg.builtin_game_folders);
+        assert_eq!(cfg.game_launchers, ["mylauncher.exe", "other.exe"]);
         assert_eq!(again.apps, cfg.apps);
         assert_eq!(again.presets, cfg.presets);
         assert_eq!(again.hotkeys.len(), cfg.hotkeys.len());

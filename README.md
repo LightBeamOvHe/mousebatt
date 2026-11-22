@@ -127,6 +127,10 @@ Right-click the tray icon > **Edit mousebatt.ini…** creates a commented exampl
   A listed program counts as running from the first time its window gets the focus until it
   closes, whatever has the focus in between: alt-tabbing writes nothing. Rates above what the
   current link supports (cable = 1 kHz) are lowered to the maximum.
+- **Game detection**: besides the built-in game folders, `game_folders = C:\Jeux | ...` adds your
+  own, `epic_library` reads the folders of the games Epic reports as installed, and
+  `launcher_games = true` also counts programs started by a launcher (Playnite, Steam, ...).
+  Settings > Game detection… does it with a folder picker.
 - **Other games**: `game_rate = 1000` gives that rate to every program installed in a known
   game folder (Steam, Epic, GOG, Xbox, Riot, Ubisoft, EA; `game_folders` replaces the list)
   that is not listed in `[apps]`. Typical setup: `default = 500` for the desktop,

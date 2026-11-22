@@ -21,6 +21,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
     wanted rate back when the periodic check finds another one.
   - Optional sound once the mouse has confirmed the rate: a soft bell note or the spoken
     number (built-in English clips, overridable with `sounds\<hz>.wav`).
+- **More ways to recognise games**: your own game folders (`game_folders`, now added to the
+  built-in list; `builtin_game_folders = false` to use only yours), the games the Epic launcher
+  reports as installed (`epic_library`, read from `LauncherInstalled.dat` and the manifests),
+  and, optionally, any program started by a game launcher (`launcher_games`, `game_launchers`;
+  Playnite, Steam, Epic, GOG Galaxy, EA, Ubisoft Connect, Battle.net, Riot, Heroic, itch,
+  Amazon Games). Settings > Game detection… edits all of it, with a folder picker.
 - **Games recognised by their install folder**: `game_rate` (and optional `game_folders`) give
   every program installed under a Steam / Epic / GOG / Xbox / Riot / Ubisoft / EA folder that
   rate when it takes the focus, so only the exceptions need to be listed in `[apps]`.

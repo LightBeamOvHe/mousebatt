@@ -153,6 +153,9 @@ thread_local! {
     /// wait handle).
     static WATCHES: RefCell<HashMap<u32, (usize, usize)>> = RefCell::new(HashMap::new());
     static RECHECK_LEFT: Cell<u8> = const { Cell::new(0) };
+    /// Programs already checked for "started by a game launcher": process id
+    /// -> answer. Keeps the process snapshot to once per program.
+    static LAUNCH_CACHE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
     /// What the tray icon shows: 0 = battery %, 1 = polling rate, 2 = both
     /// (battery over rate, smaller).
     static ICON_SHOWS: Cell<u8> = const { Cell::new(0) };
@@ -710,7 +713,7 @@ fn foreground_changed(pid: u32, exe: &str, path: &str) {
     let counts = CFG.with(|c| {
         let c = c.borrow();
         c.apps.contains_key(exe) || c.is_game_path(path, exe)
-    });
+    }) || started_by_launcher(pid, exe);
     let was_playing = paused_for_game();
     ACTIVE.with(|a| {
         let mut a = a.borrow_mut();
@@ -729,6 +732,34 @@ fn foreground_changed(pid: u32, exe: &str, path: &str) {
         start_poll(hwnd);
     }
     rules_changed(hwnd);
+}
+
+/// "Programs started by a game launcher" (Playnite, Steam, Epic, ...): only
+/// when the setting is on, for a program that is not a launcher itself, and
+/// remembered per process so the snapshot is taken once per program.
+fn started_by_launcher(pid: u32, exe: &str) -> bool {
+    let wanted = CFG.with(|c| {
+        let c = c.borrow();
+        c.launcher_games && c.game_rate.is_some() && !c.is_never_game(exe) && !c.is_launcher(exe)
+    });
+    if !wanted {
+        return false;
+    }
+    if let Some(known) = LAUNCH_CACHE.with(|m| m.borrow().get(&pid).copied()) {
+        return known;
+    }
+    let found = CFG.with(|c| {
+        let c = c.borrow();
+        watch::has_launcher_ancestor(pid, &|name| c.is_launcher(name))
+    });
+    LAUNCH_CACHE.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() > 512 {
+            m.clear();
+        }
+        m.insert(pid, found);
+    });
+    found
 }
 
 /// Windows told us that process `pid` ended (it was registered by
@@ -896,6 +927,7 @@ fn reload_config(hwnd: HWND) {
         warn_user(w);
     }
     CFG.with(|c| *c.borrow_mut() = cfg);
+    LAUNCH_CACHE.with(|m| m.borrow_mut().clear());
     sync_hotkeys(hwnd);
     sync_hook();
     rescan_running();

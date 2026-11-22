@@ -8,15 +8,18 @@
 //! so pressing one inside a hotkey box edits it instead of triggering it.
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{CreateFontW, DeleteObject, HBRUSH, HGDIOBJ};
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{InitCommonControlsEx, INITCOMMONCONTROLSEX};
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus};
+use windows_sys::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, BROWSEINFOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GetSystemMetrics,
     GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsWindowVisible, LoadCursorW,
@@ -52,6 +55,20 @@ const ID_SOUNDAUTO: i32 = 108;
 const ID_ENFORCE: i32 = 109;
 const ID_GAMEDEFAULT: i32 = 110;
 const ID_PAUSE: i32 = 111;
+const ID_DETECT: i32 = 112;
+// "Game detection" dialog.
+const DID_OK: i32 = 1; // IDOK
+const DID_CANCEL: i32 = 2; // IDCANCEL
+const DID_BUILTIN: i32 = 401;
+const DID_EPIC: i32 = 402;
+const DID_LAUNCHER: i32 = 403;
+const DID_LIST: i32 = 404;
+const DID_ADD: i32 = 405;
+const DID_REMOVE: i32 = 406;
+const DETECT_CLASS: &str = "mousebatt_detect_wnd";
+const BS_MULTILINE: u32 = 0x2000;
+const BIF_RETURNONLYFSDIRS: u32 = 0x0001;
+const BIF_NEWDIALOGSTYLE: u32 = 0x0040;
 const ID_HKLIST: i32 = 120;
 const ID_HKACTION: i32 = 121;
 const ID_HKKEY: i32 = 122;
@@ -435,12 +452,13 @@ fn build(win: HWND, main: usize, dpi: i32, font: usize, base: Config) -> Ui {
     let desktop = c("COMBOBOX", "", combo_style, ID_DESKTOP, [232, 28, 170, 200]);
     c("STATIC", "Other games (detected):", 0, 0, [24, 62, 200, 18]);
     let gamedefault = c("COMBOBOX", "", combo_style, ID_GAMEDEFAULT, [232, 58, 170, 200]);
+    c("BUTTON", "Game detection…", WS_TABSTOP, ID_DETECT, [24, 80, 150, 24]);
     c(
         "STATIC",
-        "Recognised by install folder: Steam, Epic, GOG, Xbox, Riot, Ubisoft, EA.",
+        "Which programs count as games: folders, Epic, launchers.",
         0,
         0,
-        [24, 84, 494, 18],
+        [184, 84, 334, 18],
     );
 
     c(
@@ -703,6 +721,7 @@ fn on_command(id: i32, code: u32) {
         (ID_HKADD, BN_CLICKED) => on_hotkey_add(),
         (ID_HKREMOVE, BN_CLICKED) => on_hotkey_remove(),
         (ID_HKLIST, LBN_SELCHANGE) => on_hotkey_select(),
+        (ID_DETECT, BN_CLICKED) => open_detection(),
         (ID_PROGRAM, CBN_DROPDOWN) => {
             if let Some(h) = handles() {
                 refresh_programs(&h);
@@ -959,6 +978,12 @@ fn save() {
 /// box are left alone (Enter or Esc may be part of the combination), except
 /// Tab, which still moves on.
 pub fn dialog_message(msg: &MSG) -> bool {
+    if let Some(win) = DET.with(|d| d.borrow().as_ref().map(|d| d.win)) {
+        // SAFETY: `win` is our live dialog and `msg` a valid MSG.
+        if unsafe { IsDialogMessageW(win as HWND, msg) } != 0 {
+            return true;
+        }
+    }
     let Some((win, key)) = UI.with(|u| u.borrow().as_ref().map(|u| (u.h.win, u.h.hk_key))) else {
         return false;
     };
@@ -969,4 +994,359 @@ pub fn dialog_message(msg: &MSG) -> bool {
     }
     // SAFETY: `win` is our live window and `msg` a valid MSG.
     unsafe { IsDialogMessageW(win as HWND, msg) != 0 }
+}
+
+// ---------------------------------------------------------------------------
+// "Game detection" dialog: which programs count as games.
+
+struct Detect {
+    win: usize,
+    owner: usize,
+    font: usize,
+    builtin: usize,
+    epic: usize,
+    launcher: usize,
+    list: usize,
+    /// Your own game folders, normalised, sorted.
+    folders: Vec<String>,
+}
+
+thread_local! {
+    static DET: RefCell<Option<Detect>> = const { RefCell::new(None) };
+}
+
+fn make_font(dpi: i32) -> usize {
+    // SAFETY: plain integer arguments (9 pt Segoe UI at this DPI).
+    unsafe {
+        CreateFontW(
+            -(9 * dpi / 72),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            5,
+            0,
+            crate::wide("Segoe UI").as_ptr(),
+        ) as usize
+    }
+}
+
+/// Open the dialog (or bring it to the front). It edits the detection
+/// settings of the open settings window; nothing is written to the file until
+/// that window is saved.
+fn open_detection() {
+    let Some(h) = handles() else { return };
+    if let Some(win) = DET.with(|d| d.borrow().as_ref().map(|d| d.win)) {
+        // SAFETY: handle of our own window.
+        unsafe { SetForegroundWindow(win as HWND) };
+        return;
+    }
+    let Some((builtin, epic, launcher, folders)) = UI.with(|u| {
+        u.borrow().as_ref().map(|u| {
+            (
+                u.base.builtin_game_folders,
+                u.base.epic_library,
+                u.base.launcher_games,
+                u.base.game_folders.clone(),
+            )
+        })
+    }) else {
+        return;
+    };
+
+    let class = crate::wide(DETECT_CLASS);
+    // SAFETY: WNDCLASSW is plain data for which all-zero is valid; `class`
+    // outlives the calls that use it. A second RegisterClassW just fails
+    // harmlessly. COM is started once for the modern folder picker.
+    let win = unsafe {
+        CoInitializeEx(null(), 2); // COINIT_APARTMENTTHREADED
+        let hinstance = GetModuleHandleW(null());
+        let mut wc: WNDCLASSW = zeroed();
+        wc.lpfnWndProc = Some(detect_proc);
+        wc.hInstance = hinstance;
+        wc.hCursor = LoadCursorW(null_mut(), 32512 as *const u16); // IDC_ARROW
+        wc.hbrBackground = 16usize as HBRUSH; // COLOR_BTNFACE + 1
+        wc.lpszClassName = class.as_ptr();
+        RegisterClassW(&wc);
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            crate::wide("Game detection").as_ptr(),
+            WS_WINDOW,
+            GetSystemMetrics(0) / 2,
+            GetSystemMetrics(1) / 2,
+            100,
+            100,
+            h.win as HWND, // owned by the settings window: stays in front of it
+            null_mut(),
+            hinstance,
+            null(),
+        )
+    };
+    if win.is_null() {
+        return;
+    }
+
+    // SAFETY: `win` is the window just created.
+    let dpi = unsafe { GetDpiForWindow(win) } as i32;
+    let dpi = if dpi > 0 { dpi } else { 96 };
+    let font = make_font(dpi);
+    let c = |class: &str, text: &str, style: u32, id: i32, r: [i32; 4]| {
+        child(win, class, text, style, id, r, dpi, font)
+    };
+    let builtin_box = c(
+        "BUTTON",
+        "Usual game folders (Steam, Epic, GOG, Xbox, Riot, Ubisoft, EA)",
+        BS_AUTOCHECKBOX | WS_TABSTOP,
+        DID_BUILTIN,
+        [14, 12, 432, 20],
+    );
+    let epic_box = c(
+        "BUTTON",
+        "Folders of the games installed with the Epic launcher",
+        BS_AUTOCHECKBOX | WS_TABSTOP,
+        DID_EPIC,
+        [14, 38, 432, 20],
+    );
+    let launcher_box = c(
+        "BUTTON",
+        "Programs started by a game launcher (Playnite, Steam, Epic, GOG, EA...): finds games anywhere, but is less precise",
+        BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP,
+        DID_LAUNCHER,
+        [14, 64, 432, 36],
+    );
+    c(
+        "STATIC",
+        "Your own game folders (everything inside counts as a game):",
+        0,
+        0,
+        [14, 108, 432, 18],
+    );
+    let list = c(
+        "LISTBOX",
+        "",
+        WS_BORDER | LBS_NOTIFY | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | WS_TABSTOP,
+        DID_LIST,
+        [14, 130, 432, 112],
+    );
+    c("BUTTON", "+ Add folder…", WS_TABSTOP, DID_ADD, [14, 250, 130, 26]);
+    c("BUTTON", "\u{2212} Remove", WS_TABSTOP, DID_REMOVE, [152, 250, 100, 26]);
+    c(
+        "BUTTON",
+        "OK",
+        BS_DEFPUSHBUTTON | WS_TABSTOP,
+        DID_OK,
+        [270, 290, 84, 28],
+    );
+    c("BUTTON", "Cancel", WS_TABSTOP, DID_CANCEL, [362, 290, 84, 28]);
+
+    send(builtin_box, BM_SETCHECK, usize::from(builtin), 0);
+    send(epic_box, BM_SETCHECK, usize::from(epic), 0);
+    send(launcher_box, BM_SETCHECK, usize::from(launcher), 0);
+    fill_folders(list, &folders);
+    DET.with(|d| {
+        *d.borrow_mut() = Some(Detect {
+            win: win as usize,
+            owner: h.win,
+            font,
+            builtin: builtin_box,
+            epic: epic_box,
+            launcher: launcher_box,
+            list,
+            folders,
+        })
+    });
+
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 460 * dpi / 96,
+        bottom: 330 * dpi / 96,
+    };
+    // SAFETY: `rect` is a valid in/out pointer; the windows are ours. The
+    // settings window is disabled while this dialog is open.
+    unsafe {
+        AdjustWindowRectExForDpi(&mut rect, WS_WINDOW, 0, 0, dpi as u32);
+        let (w, hgt) = (rect.right - rect.left, rect.bottom - rect.top);
+        let (x, y) = (
+            (GetSystemMetrics(0) - w) / 2,
+            (GetSystemMetrics(1) - hgt) / 2,
+        );
+        SetWindowPos(
+            win,
+            null_mut(),
+            x.max(0),
+            y.max(0),
+            w,
+            hgt,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        EnableWindow(h.win as HWND, 0);
+        ShowWindow(win, SW_SHOW);
+        SetForegroundWindow(win);
+    }
+}
+
+fn fill_folders(list: usize, folders: &[String]) {
+    send(list, LB_RESETCONTENT, 0, 0);
+    for f in folders {
+        add_str(list, LB_ADDSTRING, f);
+    }
+    send(list, LB_SETCURSEL, usize::MAX, 0); // nothing selected
+}
+
+unsafe extern "system" fn detect_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let (id, code) = ((wparam & 0xFFFF) as i32, ((wparam >> 16) & 0xFFFF) as u32);
+            match (id, code) {
+                (DID_ADD, BN_CLICKED) => detect_add(),
+                (DID_REMOVE, BN_CLICKED) => detect_remove(),
+                (DID_OK, BN_CLICKED) => detect_ok(),
+                (DID_CANCEL, BN_CLICKED) => detect_close(),
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            detect_close();
+            0
+        }
+        WM_DESTROY => {
+            detect_cleanup();
+            0
+        }
+        // SAFETY: forwarding the unchanged arguments of this very call.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn detect_close() {
+    if let Some(win) = DET.with(|d| d.borrow().as_ref().map(|d| d.win)) {
+        // SAFETY: our own window.
+        unsafe { DestroyWindow(win as HWND) };
+    }
+}
+
+/// Give the settings window back its focus and forget the dialog.
+fn detect_cleanup() {
+    let state = DET.with(|d| d.borrow_mut().take());
+    if let Some(det) = state {
+        // SAFETY: `font` was created by `open_detection` and its controls are
+        // destroyed with the window; the owner is our settings window.
+        unsafe {
+            DeleteObject(det.font as HGDIOBJ);
+            EnableWindow(det.owner as HWND, 1);
+            SetForegroundWindow(det.owner as HWND);
+        }
+    }
+}
+
+fn detect_add() {
+    let Some((win, list)) = DET.with(|d| d.borrow().as_ref().map(|d| (d.win, d.list))) else {
+        return;
+    };
+    let Some(path) = pick_folder(win) else { return };
+    let folder = config::normalize_folder(&path);
+    if folder.is_empty() {
+        return;
+    }
+    let folders = DET.with(|d| {
+        let mut d = d.borrow_mut();
+        let det = d.as_mut()?;
+        if !det.folders.contains(&folder) {
+            det.folders.push(folder);
+            det.folders.sort();
+        }
+        Some(det.folders.clone())
+    });
+    if let Some(folders) = folders {
+        fill_folders(list, &folders);
+    }
+}
+
+fn detect_remove() {
+    let Some(list) = DET.with(|d| d.borrow().as_ref().map(|d| d.list)) else {
+        return;
+    };
+    let Ok(sel) = usize::try_from(send(list, LB_GETCURSEL, 0, 0)) else {
+        return;
+    };
+    let folders = DET.with(|d| {
+        let mut d = d.borrow_mut();
+        let det = d.as_mut()?;
+        if sel < det.folders.len() {
+            det.folders.remove(sel);
+        }
+        Some(det.folders.clone())
+    });
+    if let Some(folders) = folders {
+        fill_folders(list, &folders);
+    }
+}
+
+/// OK: hand the choices to the settings window (they are saved with it).
+fn detect_ok() {
+    let Some((builtin, epic, launcher, folders)) = DET.with(|d| {
+        d.borrow().as_ref().map(|d| {
+            (
+                send(d.builtin, BM_GETCHECK, 0, 0) == 1,
+                send(d.epic, BM_GETCHECK, 0, 0) == 1,
+                send(d.launcher, BM_GETCHECK, 0, 0) == 1,
+                d.folders.clone(),
+            )
+        })
+    }) else {
+        return;
+    };
+    UI.with(|u| {
+        if let Some(ui) = u.borrow_mut().as_mut() {
+            ui.base.builtin_game_folders = builtin;
+            ui.base.epic_library = epic;
+            ui.base.launcher_games = launcher;
+            ui.base.game_folders = folders;
+        }
+    });
+    detect_close();
+}
+
+/// The system's folder picker; `None` if cancelled.
+fn pick_folder(owner: usize) -> Option<String> {
+    let mut display = [0u16; 260];
+    let title = crate::wide("Choose a folder that contains games");
+    // SAFETY: BROWSEINFOW is plain data for which all-zero is valid.
+    let mut info: BROWSEINFOW = unsafe { zeroed() };
+    info.hwndOwner = owner as HWND;
+    info.pszDisplayName = display.as_mut_ptr();
+    info.lpszTitle = title.as_ptr();
+    info.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    // SAFETY: `info` and the buffers it points to live for the call.
+    let pidl = unsafe { SHBrowseForFolderW(&info) };
+    if pidl.is_null() {
+        return None;
+    }
+    let mut path = [0u16; 520];
+    // SAFETY: `path` holds more than MAX_PATH u16s; `pidl` came from
+    // SHBrowseForFolderW and is freed exactly once.
+    let ok = unsafe {
+        let ok = SHGetPathFromIDListW(pidl, path.as_mut_ptr());
+        CoTaskMemFree(pidl as *const c_void);
+        ok
+    };
+    if ok == 0 {
+        return None;
+    }
+    let n = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+    Some(String::from_utf16_lossy(&path[..n]))
 }

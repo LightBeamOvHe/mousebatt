@@ -243,3 +243,55 @@ pub fn stop_watching(process: usize, wait: usize) {
         CloseHandle(process as HANDLE);
     }
 }
+
+/// Was process `pid` started, directly or through a few intermediate
+/// programs, by a launcher (`is_launcher` says which names are launchers)?
+/// One process snapshot to read the parent of every process; called at most
+/// once per program (the caller remembers the answer), only for a program
+/// that is not otherwise known, and never while a game runs and keeps focus.
+pub fn has_launcher_ancestor(pid: u32, is_launcher: &dyn Fn(&str) -> bool) -> bool {
+    // SAFETY: plain integer arguments; the handle is checked below.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+        return false;
+    }
+    // process id -> (parent id, lower-cased program name)
+    let mut table: std::collections::HashMap<u32, (u32, String)> = std::collections::HashMap::new();
+    // SAFETY: PROCESSENTRY32W is plain data for which all-zero is valid.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: `snap` is a valid snapshot handle and `entry` has dwSize set.
+    let mut more = unsafe { Process32FirstW(snap, &mut entry) } != 0;
+    while more {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
+        table.insert(entry.th32ProcessID, (entry.th32ParentProcessID, name));
+        // SAFETY: same as for Process32FirstW.
+        more = unsafe { Process32NextW(snap, &mut entry) } != 0;
+    }
+    // SAFETY: `snap` is a handle we own and close exactly once.
+    unsafe { CloseHandle(snap) };
+
+    // Walk up at most a few levels: game -> its own launcher stub -> launcher.
+    let mut current = pid;
+    for _ in 0..6 {
+        let Some((parent, _)) = table.get(&current) else {
+            return false;
+        };
+        let Some((_, parent_name)) = table.get(parent) else {
+            return false; // the parent has exited (or is the system)
+        };
+        if is_launcher(parent_name) {
+            return true;
+        }
+        if *parent == current || *parent == 0 {
+            return false;
+        }
+        current = *parent;
+    }
+    false
+}
