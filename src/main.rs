@@ -713,7 +713,7 @@ fn foreground_changed(pid: u32, exe: &str, path: &str) {
     let counts = CFG.with(|c| {
         let c = c.borrow();
         c.apps.contains_key(exe) || c.is_game_path(path, exe)
-    }) || started_by_launcher(pid, exe);
+    }) || started_by_launcher(pid, exe, path);
     let was_playing = paused_for_game();
     ACTIVE.with(|a| {
         let mut a = a.borrow_mut();
@@ -737,10 +737,14 @@ fn foreground_changed(pid: u32, exe: &str, path: &str) {
 /// "Programs started by a game launcher" (Playnite, Steam, Epic, ...): only
 /// when the setting is on, for a program that is not a launcher itself, and
 /// remembered per process so the snapshot is taken once per program.
-fn started_by_launcher(pid: u32, exe: &str) -> bool {
+fn started_by_launcher(pid: u32, exe: &str, path: &str) -> bool {
     let wanted = CFG.with(|c| {
         let c = c.borrow();
-        c.launcher_games && c.game_rate.is_some() && !c.is_never_game(exe) && !c.is_launcher(exe)
+        c.launcher_games
+            && c.game_rate.is_some()
+            && !c.is_never_game(exe)
+            && !c.is_launcher(exe)
+            && !c.is_ignored(path, exe)
     });
     if !wanted {
         return false;

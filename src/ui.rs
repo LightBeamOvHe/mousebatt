@@ -65,6 +65,9 @@ const DID_LAUNCHER: i32 = 403;
 const DID_LIST: i32 = 404;
 const DID_ADD: i32 = 405;
 const DID_REMOVE: i32 = 406;
+const DID_IADD: i32 = 407;
+const DID_IREMOVE: i32 = 408;
+const DID_ILIST: i32 = 409;
 const DETECT_CLASS: &str = "mousebatt_detect_wnd";
 const BS_MULTILINE: u32 = 0x2000;
 const BIF_RETURNONLYFSDIRS: u32 = 0x0001;
@@ -155,7 +158,7 @@ struct Ui {
     /// written back unchanged.
     base: Config,
     /// Games in the list: (file name, rate), sorted by name.
-    apps: Vec<(String, u16)>,
+    apps: Vec<(String, Option<u16>)>,
     /// What the hotkey drop-downs offer, in order (`None` = not used).
     actions: Vec<Option<Action>>,
     /// The hotkeys in the list, in order. The Win key can't be typed into the
@@ -325,8 +328,11 @@ fn hotkey_line(hk: &Hotkey) -> String {
     format!("{combo}      {}", action_label(&Some(hk.action.clone())))
 }
 
-fn game_label(name: &str, hz: u16) -> String {
-    format!("{name}      {hz} Hz")
+fn game_label(name: &str, rate: Option<u16>) -> String {
+    match rate {
+        Some(hz) => format!("{name}      {hz} Hz"),
+        None => format!("{name}      never a game"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +469,7 @@ fn build(win: HWND, main: usize, dpi: i32, font: usize, base: Config) -> Ui {
 
     c(
         "BUTTON",
-        "Games with their own rate (they win over the above)",
+        "Programs with their own rate, or never counted as games",
         BS_GROUPBOX,
         0,
         [10, 116, 520, 170],
@@ -474,17 +480,17 @@ fn build(win: HWND, main: usize, dpi: i32, font: usize, base: Config) -> Ui {
         "",
         CBS_DROPDOWN | WS_VSCROLL | WS_TABSTOP,
         ID_PROGRAM,
-        [82, 138, 196, 220],
+        [82, 138, 176, 220],
     );
-    c("STATIC", "Rate:", 0, 0, [288, 142, 32, 18]);
-    let gamerate = c("COMBOBOX", "", combo_style, ID_GAMERATE, [322, 138, 86, 200]);
+    c("STATIC", "Rate:", 0, 0, [266, 142, 32, 18]);
+    let gamerate = c("COMBOBOX", "", combo_style, ID_GAMERATE, [300, 138, 108, 200]);
     c("BUTTON", "+ Add / update", WS_TABSTOP, ID_ADD, [414, 137, 104, 24]);
     let list_style = WS_BORDER | LBS_NOTIFY | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | WS_TABSTOP;
     let list = c("LISTBOX", "", list_style, ID_LIST, [24, 170, 494, 70]);
     c("BUTTON", "\u{2212} Remove", WS_TABSTOP, ID_REMOVE, [24, 248, 100, 24]);
     c(
         "STATIC",
-        "Pick a program that is running, or type its file name (Task Manager > Details).",
+        "Pick a running program or type its file name. 'Never a game' = it never changes the rate.",
         0,
         0,
         [134, 246, 384, 32],
@@ -549,7 +555,13 @@ fn build(win: HWND, main: usize, dpi: i32, font: usize, base: Config) -> Ui {
     );
     c("BUTTON", "Cancel", WS_TABSTOP, ID_CANCEL, [440, 580, 90, 28]);
 
-    let mut apps: Vec<(String, u16)> = base.apps.iter().map(|(k, &v)| (k.clone(), v)).collect();
+    // (file name, rate); no rate = an exception, never counted as a game.
+    let mut apps: Vec<(String, Option<u16>)> = base
+        .apps
+        .iter()
+        .map(|(k, &v)| (k.clone(), Some(v)))
+        .chain(base.ignored.iter().map(|n| (n.clone(), None)))
+        .collect();
     apps.sort();
     let actions = action_list(&base);
     let hotkeys = base.hotkeys.clone();
@@ -612,7 +624,9 @@ fn populate() {
     fill_combo(h.gamedefault, &game_items, game_sel);
 
     let fast = PULSAR_RATES.iter().position(|&r| r == 2000).unwrap_or(0);
-    fill_combo(h.gamerate, &rate_names(), fast);
+    let mut game_rates = rate_names();
+    game_rates.push("Never a game".to_string());
+    fill_combo(h.gamerate, &game_rates, fast);
     refresh_programs(&h);
     refill_list(&h, &apps);
 
@@ -647,7 +661,7 @@ fn refill_hotkeys(h: &Handles, hotkeys: &[Hotkey]) {
     send(h.hk_list, LB_SETCURSEL, usize::MAX, 0); // nothing selected
 }
 
-fn refill_list(h: &Handles, apps: &[(String, u16)]) {
+fn refill_list(h: &Handles, apps: &[(String, Option<u16>)]) {
     send(h.list, LB_RESETCONTENT, 0, 0);
     for (name, hz) in apps {
         add_str(h.list, LB_ADDSTRING, &game_label(name, *hz));
@@ -741,16 +755,22 @@ fn on_add() {
     }
     let name = config::normalize_exe(file);
     let idx = usize::try_from(send(h.gamerate, CB_GETCURSEL, 0, 0)).ok();
-    let Some(&hz) = idx.and_then(|i| PULSAR_RATES.get(i)) else {
-        return;
+    // The last choice of the rate list is "Never a game": an exception.
+    let choice: Option<u16> = match idx {
+        Some(i) if i == PULSAR_RATES.len() => None,
+        Some(i) => match PULSAR_RATES.get(i) {
+            Some(&hz) => Some(hz),
+            None => return,
+        },
+        None => return,
     };
     let apps = UI.with(|u| {
         let mut u = u.borrow_mut();
         let ui = u.as_mut()?;
         match ui.apps.iter_mut().find(|(n, _)| *n == name) {
-            Some(entry) => entry.1 = hz,
+            Some(entry) => entry.1 = choice,
             None => {
-                ui.apps.push((name.clone(), hz));
+                ui.apps.push((name.clone(), choice));
                 ui.apps.sort();
             }
         }
@@ -787,9 +807,13 @@ fn on_list_select() {
         return;
     };
     let entry = UI.with(|u| u.borrow().as_ref().and_then(|u| u.apps.get(sel).cloned()));
-    if let Some((name, hz)) = entry {
+    if let Some((name, rate)) = entry {
         set_text(h.program, &name);
-        if let Some(pos) = PULSAR_RATES.iter().position(|&r| r == hz) {
+        let pos = match rate {
+            Some(hz) => PULSAR_RATES.iter().position(|&r| r == hz),
+            None => Some(PULSAR_RATES.len()), // "Never a game"
+        };
+        if let Some(pos) = pos {
             send(h.gamerate, CB_SETCURSEL, pos, 0);
         }
     }
@@ -941,7 +965,17 @@ fn collect(ui: &Ui) -> Result<Config, String> {
         .ok()
         .filter(|&i| i > 0)
         .and_then(|i| PULSAR_RATES.get(i - 1).copied());
-    cfg.apps = ui.apps.iter().cloned().collect::<HashMap<_, _>>();
+    cfg.apps = ui
+        .apps
+        .iter()
+        .filter_map(|(n, r)| r.map(|hz| (n.clone(), hz)))
+        .collect::<HashMap<_, _>>();
+    cfg.ignored = ui
+        .apps
+        .iter()
+        .filter(|(_, r)| r.is_none())
+        .map(|(n, _)| n.clone())
+        .collect();
     cfg.sound = match send(h.sound, CB_GETCURSEL, 0, 0) {
         1 => SoundMode::Beep,
         2 => SoundMode::Voice,
@@ -1009,6 +1043,9 @@ struct Detect {
     list: usize,
     /// Your own game folders, normalised, sorted.
     folders: Vec<String>,
+    /// Exceptions: folders whose programs never count as games.
+    ignore_list: usize,
+    ignore_folders: Vec<String>,
 }
 
 thread_local! {
@@ -1047,13 +1084,14 @@ fn open_detection() {
         unsafe { SetForegroundWindow(win as HWND) };
         return;
     }
-    let Some((builtin, epic, launcher, folders)) = UI.with(|u| {
+    let Some((builtin, epic, launcher, folders, ignore_folders)) = UI.with(|u| {
         u.borrow().as_ref().map(|u| {
             (
                 u.base.builtin_game_folders,
                 u.base.epic_library,
                 u.base.launcher_games,
                 u.base.game_folders.clone(),
+                u.base.ignore_folders.clone(),
             )
         })
     }) else {
@@ -1138,18 +1176,35 @@ fn open_detection() {
     c("BUTTON", "+ Add folder…", WS_TABSTOP, DID_ADD, [14, 250, 130, 26]);
     c("BUTTON", "\u{2212} Remove", WS_TABSTOP, DID_REMOVE, [152, 250, 100, 26]);
     c(
+        "STATIC",
+        "Exceptions: folders whose programs never count as games:",
+        0,
+        0,
+        [14, 288, 432, 18],
+    );
+    let ignore_list = c(
+        "LISTBOX",
+        "",
+        WS_BORDER | LBS_NOTIFY | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | WS_TABSTOP,
+        DID_ILIST,
+        [14, 310, 432, 80],
+    );
+    c("BUTTON", "+ Add folder…", WS_TABSTOP, DID_IADD, [14, 396, 130, 26]);
+    c("BUTTON", "\u{2212} Remove", WS_TABSTOP, DID_IREMOVE, [152, 396, 100, 26]);
+    c(
         "BUTTON",
         "OK",
         BS_DEFPUSHBUTTON | WS_TABSTOP,
         DID_OK,
-        [270, 290, 84, 28],
+        [270, 436, 84, 28],
     );
-    c("BUTTON", "Cancel", WS_TABSTOP, DID_CANCEL, [362, 290, 84, 28]);
+    c("BUTTON", "Cancel", WS_TABSTOP, DID_CANCEL, [362, 436, 84, 28]);
 
     send(builtin_box, BM_SETCHECK, usize::from(builtin), 0);
     send(epic_box, BM_SETCHECK, usize::from(epic), 0);
     send(launcher_box, BM_SETCHECK, usize::from(launcher), 0);
     fill_folders(list, &folders);
+    fill_folders(ignore_list, &ignore_folders);
     DET.with(|d| {
         *d.borrow_mut() = Some(Detect {
             win: win as usize,
@@ -1160,6 +1215,8 @@ fn open_detection() {
             launcher: launcher_box,
             list,
             folders,
+            ignore_list,
+            ignore_folders,
         })
     });
 
@@ -1167,7 +1224,7 @@ fn open_detection() {
         left: 0,
         top: 0,
         right: 460 * dpi / 96,
-        bottom: 330 * dpi / 96,
+        bottom: 476 * dpi / 96,
     };
     // SAFETY: `rect` is a valid in/out pointer; the windows are ours. The
     // settings window is disabled while this dialog is open.
@@ -1211,8 +1268,10 @@ unsafe extern "system" fn detect_proc(
         WM_COMMAND => {
             let (id, code) = ((wparam & 0xFFFF) as i32, ((wparam >> 16) & 0xFFFF) as u32);
             match (id, code) {
-                (DID_ADD, BN_CLICKED) => detect_add(),
-                (DID_REMOVE, BN_CLICKED) => detect_remove(),
+                (DID_ADD, BN_CLICKED) => detect_add(false),
+                (DID_REMOVE, BN_CLICKED) => detect_remove(false),
+                (DID_IADD, BN_CLICKED) => detect_add(true),
+                (DID_IREMOVE, BN_CLICKED) => detect_remove(true),
                 (DID_OK, BN_CLICKED) => detect_ok(),
                 (DID_CANCEL, BN_CLICKED) => detect_close(),
                 _ => {}
@@ -1253,8 +1312,14 @@ fn detect_cleanup() {
     }
 }
 
-fn detect_add() {
-    let Some((win, list)) = DET.with(|d| d.borrow().as_ref().map(|d| (d.win, d.list))) else {
+/// "+ Add folder…" for your own game folders (`exceptions` = false) or for
+/// the folders that never count as games (`exceptions` = true).
+fn detect_add(exceptions: bool) {
+    let Some((win, list)) = DET.with(|d| {
+        d.borrow()
+            .as_ref()
+            .map(|d| (d.win, if exceptions { d.ignore_list } else { d.list }))
+    }) else {
         return;
     };
     let Some(path) = pick_folder(win) else { return };
@@ -1265,19 +1330,28 @@ fn detect_add() {
     let folders = DET.with(|d| {
         let mut d = d.borrow_mut();
         let det = d.as_mut()?;
-        if !det.folders.contains(&folder) {
-            det.folders.push(folder);
-            det.folders.sort();
+        let target = if exceptions {
+            &mut det.ignore_folders
+        } else {
+            &mut det.folders
+        };
+        if !target.contains(&folder) {
+            target.push(folder);
+            target.sort();
         }
-        Some(det.folders.clone())
+        Some(target.clone())
     });
     if let Some(folders) = folders {
         fill_folders(list, &folders);
     }
 }
 
-fn detect_remove() {
-    let Some(list) = DET.with(|d| d.borrow().as_ref().map(|d| d.list)) else {
+fn detect_remove(exceptions: bool) {
+    let Some(list) = DET.with(|d| {
+        d.borrow()
+            .as_ref()
+            .map(|d| if exceptions { d.ignore_list } else { d.list })
+    }) else {
         return;
     };
     let Ok(sel) = usize::try_from(send(list, LB_GETCURSEL, 0, 0)) else {
@@ -1286,10 +1360,15 @@ fn detect_remove() {
     let folders = DET.with(|d| {
         let mut d = d.borrow_mut();
         let det = d.as_mut()?;
-        if sel < det.folders.len() {
-            det.folders.remove(sel);
+        let target = if exceptions {
+            &mut det.ignore_folders
+        } else {
+            &mut det.folders
+        };
+        if sel < target.len() {
+            target.remove(sel);
         }
-        Some(det.folders.clone())
+        Some(target.clone())
     });
     if let Some(folders) = folders {
         fill_folders(list, &folders);
@@ -1298,13 +1377,14 @@ fn detect_remove() {
 
 /// OK: hand the choices to the settings window (they are saved with it).
 fn detect_ok() {
-    let Some((builtin, epic, launcher, folders)) = DET.with(|d| {
+    let Some((builtin, epic, launcher, folders, ignore_folders)) = DET.with(|d| {
         d.borrow().as_ref().map(|d| {
             (
                 send(d.builtin, BM_GETCHECK, 0, 0) == 1,
                 send(d.epic, BM_GETCHECK, 0, 0) == 1,
                 send(d.launcher, BM_GETCHECK, 0, 0) == 1,
                 d.folders.clone(),
+                d.ignore_folders.clone(),
             )
         })
     }) else {
@@ -1316,6 +1396,7 @@ fn detect_ok() {
             ui.base.epic_library = epic;
             ui.base.launcher_games = launcher;
             ui.base.game_folders = folders;
+            ui.base.ignore_folders = ignore_folders;
         }
     });
     detect_close();

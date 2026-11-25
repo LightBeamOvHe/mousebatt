@@ -127,6 +127,9 @@ Right-click the tray icon > **Edit mousebatt.ini…** creates a commented exampl
   A listed program counts as running from the first time its window gets the focus until it
   closes, whatever has the focus in between: alt-tabbing writes nothing. Rates above what the
   current link supports (cable = 1 kHz) are lowered to the maximum.
+- **Exceptions**: `wallpaper64.exe = ignore` in `[apps]` (or "Never a game" in the settings'
+  programs list) keeps a program from ever counting as a game; `ignore_folders` does the same
+  for whole folders. They apply to every way a game can be detected.
 - **Game detection**: besides the built-in game folders, `game_folders = C:\Jeux | ...` adds your
   own, `epic_library` reads the folders of the games Epic reports as installed, and
   `launcher_games = true` also counts programs started by a launcher (Playnite, Steam, ...).

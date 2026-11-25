@@ -145,6 +145,11 @@ pub struct Config {
     pub launcher_games: bool,
     /// Launchers to recognise besides the built-in ones (lower-case names).
     pub game_launchers: Vec<String>,
+    /// Programs that never count as games, however they were detected
+    /// (lower-cased file names), e.g. Wallpaper Engine.
+    pub ignored: Vec<String>,
+    /// Folders whose programs never count as games (normalised).
+    pub ignore_folders: Vec<String>,
     /// Lower-cased program file name -> rate.
     pub apps: HashMap<String, u16>,
     /// Named rates, sorted by name. Only read by hand-edited files, but kept
@@ -170,6 +175,8 @@ impl Default for Config {
             epic_folders: Vec::new(),
             launcher_games: false,
             game_launchers: Vec::new(),
+            ignored: Vec::new(),
+            ignore_folders: Vec::new(),
             apps: HashMap::new(),
             presets: Vec::new(),
             hotkeys: Vec::new(),
@@ -315,12 +322,21 @@ impl Config {
     /// Is the program at `path` (lower-case) named `exe` (lower-case) a game
     /// by where it is installed? Always false while `game_rate` is off.
     pub fn is_game_path(&self, path: &str, exe: &str) -> bool {
-        if self.game_rate.is_none() || LAUNCHERS.contains(&exe) {
+        if self.game_rate.is_none() || LAUNCHERS.contains(&exe) || self.is_ignored(path, exe) {
             return false;
         }
         (self.builtin_game_folders && DEFAULT_GAME_FOLDERS.iter().any(|f| path.contains(f)))
             || self.game_folders.iter().any(|f| path.contains(f.as_str()))
             || self.epic_folders.iter().any(|f| path.contains(f.as_str()))
+    }
+
+    /// Is the program one of your exceptions: ignored by name, or inside an
+    /// ignored folder? It then never counts as a game, whichever way it was
+    /// detected (install folder, Epic library, launcher). Only a rate given
+    /// to it in `[apps]` is stronger.
+    pub fn is_ignored(&self, path: &str, exe: &str) -> bool {
+        self.ignored.iter().any(|n| n == exe)
+            || self.ignore_folders.iter().any(|f| path.contains(f.as_str()))
     }
 
     /// Never counted as a game, whatever else says so (launchers and helpers).
@@ -399,12 +415,23 @@ impl Config {
             match sec.as_str() {
                 "presets" => {}
                 "general" => cfg.set_general(*n, k, v, &presets),
-                "apps" => match parse_rate(v, &presets) {
-                    Some(hz) => {
-                        cfg.apps.insert(normalize_exe(k), hz);
+                "apps" => {
+                    let name = normalize_exe(k);
+                    if v.eq_ignore_ascii_case("ignore") {
+                        cfg.apps.remove(&name);
+                        if !cfg.ignored.contains(&name) {
+                            cfg.ignored.push(name);
+                        }
+                    } else if let Some(hz) = parse_rate(v, &presets) {
+                        cfg.ignored.retain(|i| *i != name);
+                        cfg.apps.insert(name, hz);
+                    } else {
+                        cfg.warn(
+                            *n,
+                            &format!("`{v}` is not a supported rate, a preset or `ignore`"),
+                        );
                     }
-                    None => cfg.warn(*n, &format!("`{v}` is not a supported rate or preset")),
-                },
+                }
                 "hotkeys" => match (parse_hotkey(k), parse_action(v, &presets)) {
                     (Ok((mods, vk)), Some(action)) => cfg.hotkeys.push(Hotkey {
                         mods,
@@ -476,6 +503,13 @@ impl Config {
                     .filter(|f| !f.is_empty())
                     .collect();
             }
+            "ignore_folders" => {
+                self.ignore_folders = value
+                    .split('|')
+                    .map(normalize_folder)
+                    .filter(|f| !f.is_empty())
+                    .collect();
+            }
             "builtin_game_folders" => match parse_bool(&lower) {
                 Some(b) => self.builtin_game_folders = b,
                 None => self.warn(n, "builtin_game_folders must be true or false"),
@@ -541,6 +575,9 @@ impl Config {
         if !self.game_folders.is_empty() {
             out.push_str(&format!("game_folders = {}\n", self.game_folders.join(" | ")));
         }
+        if !self.ignore_folders.is_empty() {
+            out.push_str(&format!("ignore_folders = {}\n", self.ignore_folders.join(" | ")));
+        }
         out.push_str(&format!("epic_library = {}\n", self.epic_library));
         out.push_str(&format!("launcher_games = {}\n", self.launcher_games));
         if !self.game_launchers.is_empty() {
@@ -557,6 +594,11 @@ impl Config {
         apps.sort();
         for (name, hz) in apps {
             out.push_str(&format!("{name} = {hz}\n"));
+        }
+        let mut ignored = self.ignored.clone();
+        ignored.sort();
+        for name in ignored {
+            out.push_str(&format!("{name} = ignore\n"));
         }
         out.push_str("\n[hotkeys]\n");
         for h in &self.hotkeys {
@@ -768,6 +810,7 @@ builtin_game_folders = false
 epic_library = false
 launcher_games = true
 game_launchers = MyLauncher.exe | other
+ignore_folders = C:\\Jeux\\Outils
 
 [presets]
 fast = 2000
@@ -776,6 +819,7 @@ eco = 500
 [apps]
 Discovery.exe = fast
 notepad = eco
+Wallpaper64.exe = ignore
 
 [hotkeys]
 Ctrl+Shift+P = 2000
@@ -885,6 +929,34 @@ Ctrl+Shift+A = auto
     }
 
     #[test]
+    fn exceptions_win_over_every_detection_method() {
+        let mut cfg = Config::parse(
+            "[general]\ngame_rate = 1000\ngame_folders = C:\\Jeux\nignore_folders = C:\\Jeux\\Outils\n\
+             [apps]\nwallpaper64.exe = ignore\ncrosshairx.exe = IGNORE\n",
+        );
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        // In a Steam folder, by name.
+        assert!(cfg.is_ignored(r"d:\steamapps\common\wallpaper_engine\wallpaper64.exe", "wallpaper64.exe"));
+        assert!(!cfg.is_game_path(r"d:\steamapps\common\wallpaper_engine\wallpaper64.exe", "wallpaper64.exe"));
+        assert!(!cfg.is_game_path(r"d:\steamapps\common\crosshair x\crosshairx.exe", "crosshairx.exe"));
+        // In one of your own folders, by name and by folder.
+        assert!(cfg.is_game_path(r"c:\jeux\fortnite\fortnite.exe", "fortnite.exe"));
+        assert!(!cfg.is_game_path(r"c:\jeux\outils\overlay.exe", "overlay.exe"));
+        assert!(cfg.is_game_path(r"c:\jeux\jeu2\jeu.exe", "jeu.exe"));
+        // Through the Epic library too.
+        cfg.epic_folders = vec![r"c:\epic\tool\".to_string()];
+        cfg.ignored.push("epictool.exe".to_string());
+        assert!(!cfg.is_game_path(r"c:\epic\tool\epictool.exe", "epictool.exe"));
+        // A rate given in [apps] is stronger than an exception.
+        let both = Config::parse("[apps]\nx.exe = ignore\nx.exe = 2000\n");
+        assert_eq!(both.apps.get("x.exe"), Some(&2000));
+        assert!(both.ignored.is_empty());
+        let other_way = Config::parse("[apps]\nx.exe = 2000\nx.exe = ignore\n");
+        assert!(other_way.apps.is_empty());
+        assert_eq!(other_way.ignored, ["x.exe"]);
+    }
+
+    #[test]
     fn detected_games_get_the_game_rate() {
         let cfg = Config::parse(
             "[general]\ndefault = 500\ngame_rate = 1000\n[apps]\nthefinals.exe = 2000\n",
@@ -951,6 +1023,10 @@ Ctrl+Shift+A = auto
         assert_eq!(again.epic_library, cfg.epic_library);
         assert_eq!(again.launcher_games, cfg.launcher_games);
         assert_eq!(again.game_launchers, cfg.game_launchers);
+        assert_eq!(again.ignored, cfg.ignored);
+        assert_eq!(again.ignore_folders, cfg.ignore_folders);
+        assert_eq!(cfg.ignored, ["wallpaper64.exe"]);
+        assert_eq!(cfg.ignore_folders, [r"c:\jeux\outils\"]);
         assert!(cfg.launcher_games && !cfg.epic_library && !cfg.builtin_game_folders);
         assert_eq!(cfg.game_launchers, ["mylauncher.exe", "other.exe"]);
         assert_eq!(again.apps, cfg.apps);

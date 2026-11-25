@@ -21,6 +21,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
     wanted rate back when the periodic check finds another one.
   - Optional sound once the mouse has confirmed the rate: a soft bell note or the spoken
     number (built-in English clips, overridable with `sounds\<hz>.wav`).
+- **Exceptions**: a program can be marked "never a game" (`name.exe = ignore` in `[apps]`, or
+  "Never a game" in the programs list of the settings), and whole folders can be excluded
+  (`ignore_folders`, Settings > Game detection…). Exceptions beat every detection method (install
+  folder, your folders, Epic library, launcher); only a rate given in `[apps]` is stronger.
 - **More ways to recognise games**: your own game folders (`game_folders`, now added to the
   built-in list; `builtin_game_folders = false` to use only yours), the games the Epic launcher
   reports as installed (`epic_library`, read from `LauncherInstalled.dat` and the manifests),
